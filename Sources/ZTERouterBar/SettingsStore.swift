@@ -28,6 +28,7 @@ final class SettingsStore {
         static let pollingInterval = "zte.router.pollingInterval"
         static let menuBarDisplayStyle = "zte.router.menuBarDisplayStyle"
         static let globalShortcutEnabled = "zte.router.globalShortcutEnabled"
+        static let systemNotificationsEnabled = "zte.router.systemNotificationsEnabled"
         static let watchdogConfig = "zte.router.watchdogConfig.v1"
         static let watchdogDefaultsVersion = "zte.router.watchdogDefaultsVersion"
         // Legacy single-profile keys for migration
@@ -35,7 +36,7 @@ final class SettingsStore {
         static let legacyHashPreference = "zte.router.hashPreference"
     }
 
-    private static let currentWatchdogDefaultsVersion = 2
+    private static let currentWatchdogDefaultsVersion = 3
 
     var profiles: [RouterProfile] {
         didSet { saveProfiles() }
@@ -59,6 +60,10 @@ final class SettingsStore {
 
     var globalShortcutEnabled: Bool {
         didSet { defaults.set(globalShortcutEnabled, forKey: Keys.globalShortcutEnabled) }
+    }
+
+    var systemNotificationsEnabled: Bool {
+        didSet { defaults.set(systemNotificationsEnabled, forKey: Keys.systemNotificationsEnabled) }
     }
 
     var watchdogConfig: WatchdogConfig {
@@ -114,6 +119,7 @@ final class SettingsStore {
         self.pollingInterval = savedInterval > 0 ? savedInterval : 3.0
         self.menuBarDisplayStyleRaw = defaults.string(forKey: Keys.menuBarDisplayStyle) ?? MenuBarDisplayStyle.iconAndBand.rawValue
         self.globalShortcutEnabled = defaults.object(forKey: Keys.globalShortcutEnabled) as? Bool ?? true
+        self.systemNotificationsEnabled = defaults.object(forKey: Keys.systemNotificationsEnabled) as? Bool ?? true
 
         if let wdData = defaults.data(forKey: Keys.watchdogConfig),
            var decodedWD = try? JSONDecoder().decode(WatchdogConfig.self, from: wdData) {
@@ -123,8 +129,9 @@ final class SettingsStore {
                     decodedWD.endpoints[idx].proxyPassword = proxyPass
                 }
             }
-            if defaults.integer(forKey: Keys.watchdogDefaultsVersion) < Self.currentWatchdogDefaultsVersion {
-                decodedWD = decodedWD.migratingLegacyV102Defaults()
+            let savedVersion = defaults.integer(forKey: Keys.watchdogDefaultsVersion)
+            if savedVersion < Self.currentWatchdogDefaultsVersion {
+                decodedWD = decodedWD.migratingLegacyDefaults(fromVersion: savedVersion)
             }
             self.watchdogConfig = decodedWD.clamped()
         } else {

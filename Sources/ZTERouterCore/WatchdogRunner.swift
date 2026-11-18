@@ -11,9 +11,18 @@ extension ZTERouterClient: RouterReconnecting {
 }
 
 public enum WatchdogEvaluator {
+    public static func weightTally(outcomes: [EndpointProbeOutcome]) -> (reachable: Int, total: Int) {
+        let total = outcomes.reduce(0) { $0 + max(1, $1.weight) }
+        let reachable = outcomes.filter(\.reachable).reduce(0) { $0 + max(1, $1.weight) }
+        return (reachable, total)
+    }
+
     public static func isHealthy(outcomes: [EndpointProbeOutcome], policy: WatchdogTriggerPolicy) -> Bool {
         guard !outcomes.isEmpty else { return false }
         switch policy {
+        case .weighted:
+            let tally = weightTally(outcomes: outcomes)
+            return tally.reachable * 2 > tally.total
         case .allUnreachable:
             // Healthy if at least one enabled endpoint is reachable.
             return outcomes.contains(where: \.reachable)
@@ -24,13 +33,14 @@ public enum WatchdogEvaluator {
     }
 
     public static func formatProbeSummary(_ outcome: EndpointProbeOutcome) -> String {
+        let weightTag = outcome.weight > 1 ? " · 权重\(outcome.weight)" : ""
         if outcome.reachable {
             let codeText = outcome.statusCode.map { "HTTP \($0)" } ?? "OK"
-            return "可达  \(outcome.name) (\(outcome.proxyMode.shortName))  \(outcome.elapsedMs)ms  \(codeText)"
+            return "可达  \(outcome.name) (\(outcome.proxyMode.shortName)\(weightTag))  \(outcome.elapsedMs)ms  \(codeText)"
         } else {
             let errText = outcome.errorMessage.map { " [\($0)]" } ?? ""
             let codeText = outcome.statusCode.map { " HTTP \($0)" } ?? ""
-            return "不可达  \(outcome.name) (\(outcome.proxyMode.shortName))  \(outcome.elapsedMs)ms\(codeText)\(errText)"
+            return "不可达  \(outcome.name) (\(outcome.proxyMode.shortName)\(weightTag))  \(outcome.elapsedMs)ms\(codeText)\(errText)"
         }
     }
 }
@@ -79,7 +89,7 @@ public struct WatchdogRunner: Sendable {
 
         await onEvent(.log(WatchdogLogEntry(
             level: .info,
-            message: "保活守护启动：\(endpoints.count) 个端点，轮询 \(config.pollIntervalSec)s，防抖复检 \(config.recheckBeforeAct) 次（间隔 \(config.recheckIntervalSec)s），单点超时 \(config.checkTimeoutMs)ms"
+            message: "保活守护启动：\(endpoints.count) 个端点，轮询 \(config.pollIntervalSec)s，连续 \(config.recheckBeforeAct + 1) 次异常重连（复检 \(config.recheckBeforeAct) 次 · 间隔 \(config.recheckIntervalSec)s），单点超时 \(config.checkTimeoutMs)ms"
         )))
         await onEvent(.phaseChanged(.monitoring))
 
@@ -89,7 +99,7 @@ public struct WatchdogRunner: Sendable {
             do {
                 let firstRound = await probeAll(endpoints: endpoints, timeoutMs: config.checkTimeoutMs, prober: prober)
                 let firstHealthy = WatchdogEvaluator.isHealthy(outcomes: firstRound, policy: config.triggerPolicy)
-                await logRound(firstRound, healthy: firstHealthy, onEvent: onEvent)
+                await logRound(firstRound, policy: config.triggerPolicy, healthy: firstHealthy, onEvent: onEvent)
 
                 if firstHealthy {
                     consecutiveReconnects = 0
@@ -111,7 +121,7 @@ public struct WatchdogRunner: Sendable {
 
                         let recheck = await probeAll(endpoints: endpoints, timeoutMs: config.checkTimeoutMs, prober: prober)
                         let recovered = WatchdogEvaluator.isHealthy(outcomes: recheck, policy: config.triggerPolicy)
-                        await logRound(recheck, healthy: recovered, onEvent: onEvent)
+                        await logRound(recheck, policy: config.triggerPolicy, healthy: recovered, onEvent: onEvent)
                         if recovered {
                             confirmedDown = false
                             await onEvent(.log(WatchdogLogEntry(
@@ -139,11 +149,14 @@ public struct WatchdogRunner: Sendable {
                         break reconnectLoop
                     }
 
+                    let triggerReason = "连续 \(config.recheckBeforeAct + 1) 次检测不可达"
                     await onEvent(.phaseChanged(.reconnecting))
-                    await onEvent(.log(WatchdogLogEntry(level: .warning, message: "确认网络受限/不可达，正在触发路由器外网重连…")))
+                    await onEvent(.autoReconnectTriggered(reason: triggerReason))
+                    await onEvent(.log(WatchdogLogEntry(level: .warning, message: "\(triggerReason)，正在触发路由器外网重连…")))
 
                     do {
                         let newState = try await router.reconnectInternet()
+                        await onEvent(.autoReconnectFinished(state: newState))
                         if !newState.isConnected {
                             await onEvent(.log(WatchdogLogEntry(
                                 level: .warning,
@@ -184,7 +197,7 @@ public struct WatchdogRunner: Sendable {
 
                     let postCheck = await probeAll(endpoints: endpoints, timeoutMs: config.checkTimeoutMs, prober: prober)
                     let postHealthy = WatchdogEvaluator.isHealthy(outcomes: postCheck, policy: config.triggerPolicy)
-                    await logRound(postCheck, healthy: postHealthy, onEvent: onEvent)
+                    await logRound(postCheck, policy: config.triggerPolicy, healthy: postHealthy, onEvent: onEvent)
 
                     if postHealthy {
                         consecutiveReconnects = 0
@@ -229,6 +242,7 @@ public struct WatchdogRunner: Sendable {
 
     private func logRound(
         _ outcomes: [EndpointProbeOutcome],
+        policy: WatchdogTriggerPolicy,
         healthy: Bool,
         onEvent: @escaping @Sendable (WatchdogEvent) async -> Void
     ) async {
@@ -239,9 +253,18 @@ public struct WatchdogRunner: Sendable {
                 message: "  \(WatchdogEvaluator.formatProbeSummary(outcome))"
             )))
         }
+        let verdict: String
+        if policy == .weighted {
+            let tally = WatchdogEvaluator.weightTally(outcomes: outcomes)
+            verdict = healthy
+                ? "==> 本轮判定：网络正常（可达权重 \(tally.reachable)/\(tally.total)）"
+                : "==> 本轮判定：未达到权重阈值（可达权重 \(tally.reachable)/\(tally.total)）"
+        } else {
+            verdict = healthy ? "==> 本轮判定：网络正常" : "==> 本轮判定：未达到可达条件"
+        }
         await onEvent(.log(WatchdogLogEntry(
             level: healthy ? .success : .warning,
-            message: healthy ? "==> 本轮判定：网络正常" : "==> 本轮判定：未达到可达条件"
+            message: verdict
         )))
     }
 }

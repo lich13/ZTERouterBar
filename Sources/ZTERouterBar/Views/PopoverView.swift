@@ -405,7 +405,10 @@ struct PopoverView: View {
     }
 
     private func signalSummaryCard(_ snap: RouterStatusSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let assessment = viewModel.currentSignalAssessment
+        let gradeColor = Formatters.signalGradeColor(assessment?.grade ?? .unknown)
+
+        return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(snap.displayProvider.isEmpty ? "蜂窝网络" : snap.displayProvider)
                     .font(.caption.weight(.semibold))
@@ -416,6 +419,14 @@ struct PopoverView: View {
                         .padding(.vertical, 2)
                         .background(Color.accentColor.opacity(0.15), in: Capsule())
                         .foregroundStyle(Color.accentColor)
+                }
+                if let assessment, assessment.grade != .unknown {
+                    Text("\(assessment.grade.rawValue) · \(assessment.score)分")
+                        .font(.caption2.weight(.semibold).monospacedDigit())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(gradeColor.opacity(0.16), in: Capsule())
+                        .foregroundStyle(gradeColor)
                 }
                 Spacer()
                 if !snap.bandSummary.isEmpty {
@@ -450,6 +461,13 @@ struct PopoverView: View {
                         metricChip(title: "PCI", value: lte.pci, color: .secondary)
                     }
                 }
+            }
+
+            if !viewModel.signalHistory.isEmpty {
+                SignalSparklineView(
+                    samples: viewModel.signalHistory,
+                    lineColor: gradeColor
+                )
             }
 
             HStack(spacing: 8) {

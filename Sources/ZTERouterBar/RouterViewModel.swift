@@ -8,9 +8,11 @@ import ZTERouterCore
 final class RouterViewModel {
     let settings: SettingsStore
     let wifiMonitor: WiFiNetworkMonitor
+    let notifier: SystemNotificationManager
     private(set) var client: ZTERouterClient?
 
     var snapshot: RouterStatusSnapshot?
+    var signalHistory: [SignalSample] = []
     var passwordInput: String = ""
     var hasStoredPassword: Bool = false
 
@@ -36,16 +38,20 @@ final class RouterViewModel {
     private var watchdogTask: Task<Void, Never>?
     private var clearMessageTask: Task<Void, Never>?
     private var userStoppedWatchdog = false
+    private var pendingAutoBeforeIP: WANIPSnapshot = WANIPSnapshot()
+    private var handledAutoReconnectFinish = false
 
     private let prober: any EndpointProbing = URLEndpointProber()
     private let watchdogRunner = WatchdogRunner()
 
     init(
         settings: SettingsStore = SettingsStore(),
-        wifiMonitor: WiFiNetworkMonitor = WiFiNetworkMonitor()
+        wifiMonitor: WiFiNetworkMonitor = WiFiNetworkMonitor(),
+        notifier: SystemNotificationManager = SystemNotificationManager()
     ) {
         self.settings = settings
         self.wifiMonitor = wifiMonitor
+        self.notifier = notifier
 
         wifiMonitor.onSSIDChanged = { [weak self] ssid in
             self?.handleWiFiSSIDChanged(ssid)
@@ -60,9 +66,17 @@ final class RouterViewModel {
         rebuildClient()
         refreshLaunchAtLoginStatus()
 
+        Task { [weak self] in
+            await self?.notifier.configureAndRequestAuthorization()
+        }
+
         if settings.watchdogConfig.autoStart && hasStoredPassword {
             startWatchdog()
         }
+    }
+
+    var currentSignalAssessment: SignalRatingAssessment? {
+        snapshot.map(SignalEvaluator.assess(snapshot:))
     }
 
     var activeProfile: RouterProfile {
@@ -215,7 +229,8 @@ final class RouterViewModel {
             timeoutMs: settings.watchdogConfig.checkTimeoutMs,
             prober: prober
         )
-        let healthy = WatchdogEvaluator.isHealthy(outcomes: results, policy: settings.watchdogConfig.triggerPolicy)
+        let policy = settings.watchdogConfig.triggerPolicy
+        let healthy = WatchdogEvaluator.isHealthy(outcomes: results, policy: policy)
         lastProbeOutcomes = results
         lastWatchdogHealthy = healthy
         for item in results {
@@ -224,9 +239,18 @@ final class RouterViewModel {
                 message: "  \(WatchdogEvaluator.formatProbeSummary(item))"
             ))
         }
+        let verdict: String
+        if policy == .weighted {
+            let tally = WatchdogEvaluator.weightTally(outcomes: results)
+            verdict = healthy
+                ? "==> 单轮探测结果：网络正常（可达权重 \(tally.reachable)/\(tally.total)）"
+                : "==> 单轮探测结果：未达到权重阈值（可达权重 \(tally.reachable)/\(tally.total)）"
+        } else {
+            verdict = healthy ? "==> 单轮探测结果：网络正常" : "==> 单轮探测结果：未达到可达条件"
+        }
         appendWatchdogLog(WatchdogLogEntry(
             level: healthy ? .success : .warning,
-            message: healthy ? "==> 单轮探测结果：网络正常" : "==> 单轮探测结果：未达到可达条件"
+            message: verdict
         ))
     }
 
@@ -239,12 +263,28 @@ final class RouterViewModel {
         case let .phaseChanged(phase):
             let previous = watchdogPhase
             watchdogPhase = phase
-            if previous == .reconnecting && phase != .reconnecting {
+            if previous == .reconnecting && phase != .reconnecting && !handledAutoReconnectFinish {
                 Task { await refreshNow(silent: true) }
             }
         case let .probeRoundCompleted(outcomes, overallHealthy):
             lastProbeOutcomes = outcomes
             lastWatchdogHealthy = overallHealthy
+        case let .autoReconnectTriggered(reason):
+            handledAutoReconnectFinish = false
+            pendingAutoBeforeIP = WANIPSnapshot(snapshot: snapshot)
+            if settings.systemNotificationsEnabled {
+                notifier.notifyAutoReconnectTriggered(
+                    profileName: activeProfile.name,
+                    reason: reason,
+                    currentIP: pendingAutoBeforeIP
+                )
+            }
+        case let .autoReconnectFinished(state):
+            handledAutoReconnectFinish = true
+            let beforeIP = pendingAutoBeforeIP
+            Task { [weak self] in
+                await self?.finalizeReconnectIPTracking(isAutomatic: true, state: state, beforeIP: beforeIP)
+            }
         case let .log(entry):
             appendWatchdogLog(entry)
         }
@@ -283,6 +323,7 @@ final class RouterViewModel {
         guard settings.profiles.contains(where: { $0.id == profileID }) else { return }
         settings.activeProfileID = profileID
         snapshot = nil
+        signalHistory.removeAll()
         lastError = nil
         isSessionOccupied = false
         reloadPasswordFromKeychain()
@@ -336,6 +377,7 @@ final class RouterViewModel {
         if activateAndTest {
             settings.activeProfileID = profile.id
             snapshot = nil
+            signalHistory.removeAll()
             isSessionOccupied = false
             reloadPasswordFromKeychain()
             rebuildClient()
@@ -433,6 +475,7 @@ final class RouterViewModel {
         do {
             let fresh = try await client.fetchStatus(reclaimIfDuplicate: !silent)
             self.snapshot = fresh
+            self.recordSignalSample(from: fresh)
             self.lastError = nil
             self.isSessionOccupied = false
         } catch let routerError as ZTERouterError {
@@ -468,11 +511,22 @@ final class RouterViewModel {
         defer { isReconnectingWAN = false }
         lastError = nil
 
+        var beforeIP = WANIPSnapshot(snapshot: snapshot)
+        if beforeIP.isEmpty {
+            await waitForIdleRefreshAndFetch(silent: true)
+            beforeIP = WANIPSnapshot(snapshot: snapshot)
+        }
+
         do {
             let newState = try await client.reconnectInternet()
             isSessionOccupied = false
-            await refreshNow(silent: true)
-            showToast(newState.isConnected ? "外网重连成功" : "已触发重连，状态：\(newState.localizedLabel)")
+            let afterIP = await finalizeReconnectIPTracking(isAutomatic: false, state: newState, beforeIP: beforeIP)
+            if newState.isConnected {
+                let ipSuffix = afterIP.hasChanged(from: beforeIP) ? "（外网 IP 已更新）" : ""
+                showToast("外网重连成功\(ipSuffix)")
+            } else {
+                showToast("已触发重连，状态：\(newState.localizedLabel)")
+            }
         } catch let routerError as ZTERouterError {
             if routerError == .duplicateUser {
                 isSessionOccupied = true
@@ -481,6 +535,59 @@ final class RouterViewModel {
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    private func recordSignalSample(from fresh: RouterStatusSnapshot) {
+        guard let sample = SignalEvaluator.sample(from: fresh) else { return }
+        if let last = signalHistory.last, last.timestamp == sample.timestamp {
+            signalHistory[signalHistory.count - 1] = sample
+        } else {
+            signalHistory.append(sample)
+        }
+        if signalHistory.count > 120 {
+            signalHistory.removeFirst(signalHistory.count - 120)
+        }
+    }
+
+    @discardableResult
+    private func finalizeReconnectIPTracking(
+        isAutomatic: Bool,
+        state: WANConnectionState,
+        beforeIP: WANIPSnapshot
+    ) async -> WANIPSnapshot {
+        await waitForIdleRefreshAndFetch(silent: true)
+        var afterIP = WANIPSnapshot(snapshot: snapshot)
+
+        // ZTE firmware may take ~1s after `CONNECT_NETWORK` settles to populate `wan_ipaddr`.
+        if state.isConnected && (afterIP.isEmpty || (!beforeIP.isEmpty && !afterIP.hasChanged(from: beforeIP))) {
+            try? await Task.sleep(for: .milliseconds(1200))
+            await waitForIdleRefreshAndFetch(silent: true)
+            afterIP = WANIPSnapshot(snapshot: snapshot)
+        }
+
+        let summary = WANIPChangeFormatter.formatLogSummary(before: beforeIP, after: afterIP)
+        if isAutomatic {
+            appendWatchdogLog(WatchdogLogEntry(level: .info, message: "重连 IP 对比：\(summary)"))
+        }
+
+        if settings.systemNotificationsEnabled {
+            notifier.notifyReconnectIPChange(
+                isAutomatic: isAutomatic,
+                profileName: activeProfile.name,
+                state: state,
+                before: beforeIP,
+                after: afterIP
+            )
+        }
+        return afterIP
+    }
+
+    private func waitForIdleRefreshAndFetch(silent: Bool) async {
+        for _ in 0..<10 {
+            if !isRefreshing { break }
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+        await refreshNow(silent: silent)
     }
 
     // MARK: - Launch at Login

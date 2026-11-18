@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import ZTERouterCore
 
 enum Formatters {
     static func speedBits(_ bytesPerSecond: Double) -> String {
@@ -53,5 +54,16 @@ enum Formatters {
         if val >= 13 { return .blue }
         if val >= 0 { return .orange }
         return .red
+    }
+
+    static func signalGradeColor(_ grade: SignalQualityGrade) -> Color {
+        switch grade {
+        case .excellent: .green
+        case .good: .blue
+        case .fair: .orange
+        case .poor: Color(red: 0.92, green: 0.35, blue: 0.2)
+        case .veryPoor: .red
+        case .unknown: .secondary
+        }
     }
 }

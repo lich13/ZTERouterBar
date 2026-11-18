@@ -9,15 +9,16 @@
   - **`⌥ + 左键` 点击状态栏图标**直接触发重连
   - **全局快捷键 `⌃⌥W`** 或右键菜单一键重连（无需弹窗确认）
   - 执行 `DISCONNECT_NETWORK` → 等待断开 → `CONNECT_NETWORK` → 等待重新拨号成功
-- **实时信号与终端监控**
+- **实时信号评级、趋势曲线与终端监控**
+  - 基于 RSRP / SINR / RSRQ 输出 0–100 综合信号评级（极佳 / 良好 / 一般 / 较差 / 极弱），并在概览页及状态栏弹窗绘制实时信号变化曲线
   - 通过 `wifi_access_sta_num` 与单独查询 `station_list` / `lan_station_list`（不带 `multi_data=1`）准确获取无线/有线终端数量及设备列表
   - 展示 5G NR / 4G LTE / 3G UMTS 信号指标（RSRP / SINR / RSRQ / PCI / 频段与带宽）、邻区、温度、实时速率与流量统计
 - **多路由器配置 & Wi-Fi 名称自动匹配**
   - 支持保存多个路由器配置（名称、地址、管理密码、AD 算法、绑定多个 Wi-Fi SSID）
   - 使用 `CoreWLAN` + `CoreLocation` 识别当前连接的 Wi-Fi 名称，自动切换对应配置与钥匙串凭据
-- **外网限流自动保活守护（Watchdog）**
-  - 打开 App 默认自动启动保活守护，采用 GFW 列表（`gfw.txt`）多骨干海外轻量 HTTPS 预设（`YouTube 204` / `Cloudflare DoH` / `GitHub Assets` / `Dropbox`，默认跟随系统代理；单端点支持独立配置跟随系统代理 / 直连 / HTTP / SOCKS5，默认参数 `4000ms` 超时、`33s` 轮询、`3` 次防抖复检、`3s` 复检间隔）
-  - 全部启用端点不可达并经防抖复检确认后，自动执行外网重连与重连后复检确认，支持连续重连冷却保护
+- **外网限流自动保活守护（Watchdog）与系统通知**
+  - 打开 App 默认自动启动保活守护，以 `https://661313.xyz/test/success.txt`（权重 `3`，校验 `success` 内容）为主节点并搭配 `YouTube 204` / `Cloudflare DoH`（权重 `1`），默认按权重过半判定，连续不通 `2` 次（首轮异常 + `3s` 后复检 `1` 次）立即重连
+  - 触发自动重连及每次手动/自动重连前后的 WAN IPv4/IPv6 变化均自动推送 macOS 系统通知
 
 ## 本地构建与测试
 

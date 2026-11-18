@@ -140,6 +140,14 @@ private struct SignalOverviewTab: View {
                 VStack(alignment: .leading, spacing: 16) {
                     trafficAndSummaryRow(snap)
 
+                    if let assessment = viewModel.currentSignalAssessment {
+                        SignalQualityDashboardCard(
+                            assessment: assessment,
+                            samples: viewModel.signalHistory,
+                            signalBars: snap.signalBars
+                        )
+                    }
+
                     if !snap.nrCells.isEmpty {
                         sectionHeader("5G NR 小区信号")
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 12)], spacing: 12) {

@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UserNotifications
 import ZTERouterCore
 
 struct WatchdogView: View {
@@ -27,6 +28,7 @@ struct WatchdogView: View {
         .onAppear {
             draftConfig = viewModel.settings.watchdogConfig
             hasUnappliedEdits = false
+            Task { await viewModel.notifier.refreshAuthorizationStatus() }
         }
     }
 
@@ -147,15 +149,33 @@ struct WatchdogView: View {
 
                 TextField("名称", text: endpoint.name, prompt: Text("名称"))
                     .textFieldStyle(.roundedBorder)
-                    .frame(width: 120)
+                    .frame(width: 108)
                     .onChange(of: epVal.name) { _, _ in markDirty() }
                     .onSubmit { applyDraftConfig() }
 
-                TextField("检测链接 (http/https)", text: endpoint.urlString, prompt: Text("https://www.youtube.com/generate_204"))
+                TextField("检测链接 (http/https)", text: endpoint.urlString, prompt: Text("https://661313.xyz/test/success.txt"))
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
-                    .onChange(of: epVal.urlString) { _, _ in markDirty() }
+                    .onChange(of: epVal.urlString) { _, newURL in
+                        let lower = newURL.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        if lower.contains("661313.xyz/test/success.txt") {
+                            endpoint.wrappedValue.expectedResponseText = "success"
+                        } else if endpoint.wrappedValue.expectedResponseText == "success" {
+                            endpoint.wrappedValue.expectedResponseText = ""
+                        }
+                        markDirty()
+                    }
                     .onSubmit { applyDraftConfig() }
+
+                Picker("", selection: endpoint.weight) {
+                    ForEach(1...10, id: \.self) { w in
+                        Text("权重 \(w)").tag(w)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 78)
+                .help("端点权重（1–10）。选择按权重判定时，可达权重之和须超过总权重 50%")
+                .onChange(of: epVal.weight) { _, _ in applyDraftConfig() }
 
                 Picker("", selection: endpoint.proxyMode) {
                     ForEach(EndpointProxyMode.allCases) { mode in
@@ -163,7 +183,7 @@ struct WatchdogView: View {
                     }
                 }
                 .labelsHidden()
-                .frame(width: 100)
+                .frame(width: 92)
                 .onChange(of: epVal.proxyMode) { _, _ in applyDraftConfig() }
 
                 outcomeBadge(outcome)
@@ -252,12 +272,31 @@ struct WatchdogView: View {
                 Toggle("仅在当前连接的 Wi-Fi 已匹配当前路由器配置时自动重连", isOn: $draftConfig.onlyWhenWiFiMatched)
                     .onChange(of: draftConfig.onlyWhenWiFiMatched) { _, _ in applyDraftConfig() }
 
+                Toggle("自动重连与重连前后 IP 变化时推送 macOS 系统通知（含手动重连）", isOn: Bindable(viewModel.settings).systemNotificationsEnabled)
+
+                if viewModel.settings.systemNotificationsEnabled && viewModel.notifier.authorizationStatus == .denied {
+                    HStack(spacing: 8) {
+                        Image(systemName: "bell.slash.fill")
+                            .foregroundStyle(.orange)
+                        Text("系统通知权限已被拒绝，请在系统设置中允许 ZTERouterBar 发送通知。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("打开通知设置") {
+                            viewModel.notifier.openSystemNotificationSettings()
+                        }
+                        .controlSize(.small)
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
+                }
+
                 Picker("触发重连条件:", selection: $draftConfig.triggerPolicy) {
                     ForEach(WatchdogTriggerPolicy.allCases) { policy in
                         Text(policy.displayName).tag(policy)
                     }
                 }
-                .frame(maxWidth: 420)
+                .frame(maxWidth: 460)
                 .onChange(of: draftConfig.triggerPolicy) { _, _ in applyDraftConfig() }
 
                 Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 8) {
@@ -274,6 +313,10 @@ struct WatchdogView: View {
                         numberInput("触发上限后冷却 (秒)", value: $draftConfig.cooldownSec, range: 10...600)
                     }
                 }
+
+                Text("触发节奏：首轮检测异常后间隔 \(draftConfig.recheckIntervalSec)s 再复检 \(draftConfig.recheckBeforeAct) 次，即连续 \(draftConfig.recheckBeforeAct + 1) 次不通立刻触发重连。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 HStack {
                     Button("恢复默认参数") {

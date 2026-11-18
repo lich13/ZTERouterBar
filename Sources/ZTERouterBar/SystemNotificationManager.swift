@@ -1,0 +1,127 @@
+import AppKit
+import Foundation
+import UserNotifications
+import ZTERouterCore
+
+@MainActor
+protocol UserNotificationSending: AnyObject {
+    var authorizationStatus: UNAuthorizationStatus { get }
+    func configureAndRequestAuthorization() async
+    func refreshAuthorizationStatus() async
+    func notifyAutoReconnectTriggered(profileName: String, reason: String, currentIP: WANIPSnapshot)
+    func notifyReconnectIPChange(
+        isAutomatic: Bool,
+        profileName: String,
+        state: WANConnectionState,
+        before: WANIPSnapshot,
+        after: WANIPSnapshot
+    )
+}
+
+@MainActor
+@Observable
+final class SystemNotificationManager: NSObject, UserNotificationSending, @preconcurrency UNUserNotificationCenterDelegate {
+    private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
+
+    private let canUseCenter: Bool
+    private var didConfigureDelegate = false
+
+    override init() {
+        self.canUseCenter = (
+            Bundle.main.bundleURL.pathExtension == "app"
+                && Bundle.main.bundleIdentifier != nil
+        )
+        super.init()
+    }
+
+    func configureAndRequestAuthorization() async {
+        guard canUseCenter else { return }
+        let center = UNUserNotificationCenter.current()
+        if !didConfigureDelegate {
+            center.delegate = self
+            didConfigureDelegate = true
+        }
+        let settings = await center.notificationSettings()
+        authorizationStatus = settings.authorizationStatus
+        if settings.authorizationStatus == .notDetermined {
+            _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
+            let updated = await center.notificationSettings()
+            authorizationStatus = updated.authorizationStatus
+        }
+    }
+
+    func refreshAuthorizationStatus() async {
+        guard canUseCenter else { return }
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        authorizationStatus = settings.authorizationStatus
+    }
+
+    func openSystemNotificationSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func notifyAutoReconnectTriggered(profileName: String, reason: String, currentIP: WANIPSnapshot) {
+        let title = "ZTERouterBar · 正在自动重连外网"
+        var lines: [String] = ["路由器「\(profileName)」\(reason)，已触发重新拨号。"]
+        if !currentIP.ipv4.isEmpty {
+            lines.append("当前 IPv4：\(currentIP.ipv4)")
+        }
+        if !currentIP.ipv6.isEmpty {
+            lines.append("当前 IPv6：\(currentIP.ipv6)")
+        }
+        deliver(identifierPrefix: "zte.auto.trigger", title: title, body: lines.joined(separator: "\n"))
+    }
+
+    func notifyReconnectIPChange(
+        isAutomatic: Bool,
+        profileName: String,
+        state: WANConnectionState,
+        before: WANIPSnapshot,
+        after: WANIPSnapshot
+    ) {
+        let formatted = WANIPChangeFormatter.formatNotificationMessage(
+            isAutomatic: isAutomatic,
+            profileName: profileName,
+            state: state,
+            before: before,
+            after: after
+        )
+        deliver(
+            identifierPrefix: isAutomatic ? "zte.auto.ip" : "zte.manual.ip",
+            title: formatted.title,
+            body: formatted.body
+        )
+    }
+
+    private func deliver(identifierPrefix: String, title: String, body: String) {
+        guard canUseCenter else { return }
+        let center = UNUserNotificationCenter.current()
+        if !didConfigureDelegate {
+            center.delegate = self
+            didConfigureDelegate = true
+        }
+
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "\(identifierPrefix).\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        center.add(request)
+    }
+
+    // Ensure banners are presented even when Dashboard/Settings window is active in foreground.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .list, .sound])
+    }
+}
