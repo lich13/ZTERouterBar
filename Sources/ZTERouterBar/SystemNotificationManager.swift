@@ -37,11 +37,7 @@ final class SystemNotificationManager: NSObject, UserNotificationSending, @preco
 
     func configureAndRequestAuthorization() async {
         guard canUseCenter else { return }
-        let center = UNUserNotificationCenter.current()
-        if !didConfigureDelegate {
-            center.delegate = self
-            didConfigureDelegate = true
-        }
+        let center = configuredCenter()
         let status = await Self.fetchAuthorizationStatus()
         authorizationStatus = status
         if status == .notDetermined {
@@ -113,13 +109,18 @@ final class SystemNotificationManager: NSObject, UserNotificationSending, @preco
         )
     }
 
-    private func deliver(identifierPrefix: String, title: String, body: String) {
-        guard canUseCenter else { return }
+    private func configuredCenter() -> UNUserNotificationCenter {
         let center = UNUserNotificationCenter.current()
         if !didConfigureDelegate {
             center.delegate = self
             didConfigureDelegate = true
         }
+        return center
+    }
+
+    private func deliver(identifierPrefix: String, title: String, body: String) {
+        guard canUseCenter else { return }
+        let center = configuredCenter()
 
         let content = UNMutableNotificationContent()
         content.title = title

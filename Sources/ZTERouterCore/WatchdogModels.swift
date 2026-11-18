@@ -29,9 +29,9 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
     public static let defaultIntervalSec = 33
     public static let defaultTimeoutSec = 4
 
-    enum CodingKeys: String, CodingKey {
-        case id, isEnabled, name, urlString, weight, intervalSec, timeoutSec
-    }
+    public static let weightRange = 1...10
+    public static let intervalRange = 5...3600
+    public static let timeoutRange = 1...30
 
     public init(
         id: UUID = UUID(),
@@ -46,20 +46,22 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
         self.isEnabled = isEnabled
         self.name = name
         self.urlString = urlString
-        self.weight = min(max(weight, 1), 10)
-        self.intervalSec = min(max(intervalSec, 5), 3600)
-        self.timeoutSec = min(max(timeoutSec, 1), 30)
+        self.weight = weight.clamped(to: Self.weightRange)
+        self.intervalSec = intervalSec.clamped(to: Self.intervalRange)
+        self.timeoutSec = timeoutSec.clamped(to: Self.timeoutRange)
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
-        isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
-        name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
-        urlString = try container.decodeIfPresent(String.self, forKey: .urlString) ?? ""
-        weight = min(max(try container.decodeIfPresent(Int.self, forKey: .weight) ?? Self.defaultWeight, 1), 10)
-        intervalSec = min(max(try container.decodeIfPresent(Int.self, forKey: .intervalSec) ?? Self.defaultIntervalSec, 5), 3600)
-        timeoutSec = min(max(try container.decodeIfPresent(Int.self, forKey: .timeoutSec) ?? Self.defaultTimeoutSec, 1), 30)
+        self.init(
+            id: try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(),
+            isEnabled: try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true,
+            name: try container.decodeIfPresent(String.self, forKey: .name) ?? "",
+            urlString: try container.decodeIfPresent(String.self, forKey: .urlString) ?? "",
+            weight: try container.decodeIfPresent(Int.self, forKey: .weight) ?? Self.defaultWeight,
+            intervalSec: try container.decodeIfPresent(Int.self, forKey: .intervalSec) ?? Self.defaultIntervalSec,
+            timeoutSec: try container.decodeIfPresent(Int.self, forKey: .timeoutSec) ?? Self.defaultTimeoutSec
+        )
     }
 
     public var isValidHTTPURL: Bool {
@@ -179,9 +181,14 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
     public static let defaultMaxConsecutiveReconnects = 3
     public static let defaultCooldownSec = 300
 
-    enum CodingKeys: String, CodingKey {
-        case autoStart, autoReconnectEnabled, failureWindowSec, recheckIntervalSec, postReconnectGraceSec, maxConsecutiveReconnects, cooldownSec, triggerPolicy, onlyWhenWiFiMatched, endpoints
-        // Legacy keys decoded only when upgrading older persisted configs that lack per-endpoint timing.
+    public static let failureWindowRange = 10...600
+    public static let recheckIntervalRange = 1...60
+    public static let postReconnectGraceRange = 0...600
+    public static let maxConsecutiveReconnectsRange = 1...10
+    public static let cooldownRange = 10...600
+
+    /// Decoded only when upgrading older persisted configs that lack per-endpoint timing; never encoded.
+    private enum LegacyCodingKeys: String, CodingKey {
         case checkTimeoutMs, pollIntervalSec
     }
 
@@ -222,8 +229,9 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
         onlyWhenWiFiMatched = try container.decodeIfPresent(Bool.self, forKey: .onlyWhenWiFiMatched) ?? false
 
         var decodedEndpoints = try container.decodeIfPresent([WatchdogEndpoint].self, forKey: .endpoints) ?? WatchdogEndpoint.defaultPresets
-        let legacyPollSec = try container.decodeIfPresent(Int.self, forKey: .pollIntervalSec)
-        let legacyTimeoutSec = (try container.decodeIfPresent(Int.self, forKey: .checkTimeoutMs)).map { max(1, Int((Double($0) / 1000.0).rounded())) }
+        let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+        let legacyPollSec = try legacy.decodeIfPresent(Int.self, forKey: .pollIntervalSec)
+        let legacyTimeoutSec = (try legacy.decodeIfPresent(Int.self, forKey: .checkTimeoutMs)).map { max(1, Int((Double($0) / 1000.0).rounded())) }
         if legacyPollSec != nil || legacyTimeoutSec != nil {
             for idx in decodedEndpoints.indices {
                 if let legacyPollSec { decodedEndpoints[idx].intervalSec = legacyPollSec }
@@ -231,20 +239,6 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
             }
         }
         endpoints = decodedEndpoints.map { $0.clamped() }
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(autoStart, forKey: .autoStart)
-        try container.encode(autoReconnectEnabled, forKey: .autoReconnectEnabled)
-        try container.encode(failureWindowSec, forKey: .failureWindowSec)
-        try container.encode(recheckIntervalSec, forKey: .recheckIntervalSec)
-        try container.encode(postReconnectGraceSec, forKey: .postReconnectGraceSec)
-        try container.encode(maxConsecutiveReconnects, forKey: .maxConsecutiveReconnects)
-        try container.encode(cooldownSec, forKey: .cooldownSec)
-        try container.encode(triggerPolicy, forKey: .triggerPolicy)
-        try container.encode(onlyWhenWiFiMatched, forKey: .onlyWhenWiFiMatched)
-        try container.encode(endpoints, forKey: .endpoints)
     }
 
     public var enabledValidEndpoints: [WatchdogEndpoint] {
@@ -255,11 +249,11 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
 
     public func clamped() -> WatchdogConfig {
         var copy = self
-        copy.failureWindowSec = min(max(failureWindowSec, 10), 600)
-        copy.recheckIntervalSec = min(max(recheckIntervalSec, 1), 60)
-        copy.postReconnectGraceSec = min(max(postReconnectGraceSec, 0), 600)
-        copy.maxConsecutiveReconnects = min(max(maxConsecutiveReconnects, 1), 10)
-        copy.cooldownSec = min(max(cooldownSec, 10), 600)
+        copy.failureWindowSec = failureWindowSec.clamped(to: Self.failureWindowRange)
+        copy.recheckIntervalSec = recheckIntervalSec.clamped(to: Self.recheckIntervalRange)
+        copy.postReconnectGraceSec = postReconnectGraceSec.clamped(to: Self.postReconnectGraceRange)
+        copy.maxConsecutiveReconnects = maxConsecutiveReconnects.clamped(to: Self.maxConsecutiveReconnectsRange)
+        copy.cooldownSec = cooldownSec.clamped(to: Self.cooldownRange)
         copy.endpoints = endpoints.map { $0.clamped() }
         return copy
     }
@@ -320,6 +314,12 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
     /// Returns a copy keeping current endpoints while restoring all strategy and timing parameters to defaults.
     public func withDefaultParameters() -> WatchdogConfig {
         WatchdogConfig(endpoints: endpoints)
+    }
+}
+
+extension Comparable {
+    func clamped(to range: ClosedRange<Self>) -> Self {
+        min(max(self, range.lowerBound), range.upperBound)
     }
 }
 

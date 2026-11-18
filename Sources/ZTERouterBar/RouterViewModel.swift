@@ -42,7 +42,6 @@ final class RouterViewModel {
     var isWatchdogRunning: Bool = false
     var watchdogPhase: WatchdogPhase = .idle
     var lastProbeOutcomes: [EndpointProbeOutcome] = []
-    var lastWatchdogHealthy: Bool?
     var watchdogLogs: [WatchdogLogEntry] = []
     var isProbingOnce: Bool = false
 
@@ -275,26 +274,9 @@ final class RouterViewModel {
         let policy = settings.watchdogConfig.triggerPolicy
         let healthy = WatchdogEvaluator.isHealthy(outcomes: results, policy: policy)
         lastProbeOutcomes = results
-        lastWatchdogHealthy = healthy
-        for item in results {
-            appendWatchdogLog(WatchdogLogEntry(
-                level: item.reachable ? .info : .warning,
-                message: "  \(WatchdogEvaluator.formatProbeSummary(item))"
-            ))
-        }
-        let verdict: String
-        if policy == .weighted {
-            let tally = WatchdogEvaluator.weightTally(outcomes: results)
-            verdict = healthy
-                ? "==> 单轮探测结果：网络正常（可达权重 \(tally.reachable)/\(tally.total)）"
-                : "==> 单轮探测结果：未达到权重阈值（可达权重 \(tally.reachable)/\(tally.total)）"
-        } else {
-            verdict = healthy ? "==> 单轮探测结果：网络正常" : "==> 单轮探测结果：未达到可达条件"
-        }
-        appendWatchdogLog(WatchdogLogEntry(
-            level: healthy ? .success : .warning,
-            message: verdict
-        ))
+        WatchdogEvaluator.roundLogEntries(
+            probed: results, snapshot: results, policy: policy, healthy: healthy, verdictLabel: "单轮探测结果"
+        ).forEach(appendWatchdogLog)
     }
 
     func clearWatchdogLogs() {
@@ -310,9 +292,8 @@ final class RouterViewModel {
             if previous == .reconnecting && phase != .reconnecting && !handledAutoReconnectFinish {
                 Task { await refreshNow(silent: true) }
             }
-        case let .probeRoundCompleted(outcomes, overallHealthy):
+        case let .probeRoundCompleted(outcomes, _):
             lastProbeOutcomes = outcomes
-            lastWatchdogHealthy = overallHealthy
         case let .probeFailureDetected(reason):
             if settings.systemNotificationsEnabled {
                 notifier.notifyProbeFailure(
@@ -386,9 +367,7 @@ final class RouterViewModel {
         }
         if hasStoredPassword {
             Task { await refreshNow(silent: false) }
-            if isWatchdogRunning {
-                startWatchdog()
-            } else if settings.watchdogConfig.autoStart && !userStoppedWatchdog {
+            if isWatchdogRunning || (settings.watchdogConfig.autoStart && !userStoppedWatchdog) {
                 startWatchdog()
             }
         } else if isWatchdogRunning {

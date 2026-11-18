@@ -101,14 +101,7 @@ struct WatchdogView: View {
                         .font(.subheadline.weight(.semibold))
                     Spacer()
                     Button {
-                        draftConfig.endpoints.append(WatchdogEndpoint(
-                            isEnabled: true,
-                            name: "自定义站点",
-                            urlString: "https://",
-                            weight: 1,
-                            intervalSec: 33,
-                            timeoutSec: 4
-                        ))
+                        draftConfig.endpoints.append(WatchdogEndpoint(name: "自定义站点", urlString: "https://"))
                         markDirty()
                     } label: {
                         Label("新增端点", systemImage: "plus")
@@ -162,7 +155,7 @@ struct WatchdogView: View {
                     .onSubmit { applyDraftConfig() }
 
                 Picker("", selection: endpoint.weight) {
-                    ForEach(1...10, id: \.self) { w in
+                    ForEach(Array(WatchdogEndpoint.weightRange), id: \.self) { w in
                         Text("权重 \(w)").tag(w)
                     }
                 }
@@ -184,8 +177,8 @@ struct WatchdogView: View {
             }
 
             HStack(spacing: 18) {
-                inlineNumberInput("检测频率 (s)", value: endpoint.intervalSec, range: 5...3600)
-                inlineNumberInput("单次超时 (s)", value: endpoint.timeoutSec, range: 1...30)
+                numberInput("检测频率 (s)", value: endpoint.intervalSec, range: WatchdogEndpoint.intervalRange, fieldWidth: 56)
+                numberInput("单次超时 (s)", value: endpoint.timeoutSec, range: WatchdogEndpoint.timeoutRange, fieldWidth: 56)
                 Spacer()
             }
             .padding(.leading, 28)
@@ -194,44 +187,18 @@ struct WatchdogView: View {
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    private func inlineNumberInput(_ title: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {
-        HStack(spacing: 6) {
-            Text(title + ":")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            TextField("", value: value, format: .number)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 56)
-                .onChange(of: value.wrappedValue) { _, _ in markDirty() }
-                .onSubmit { applyDraftConfig() }
-            Stepper("", value: value, in: range)
-                .labelsHidden()
-                .onChange(of: value.wrappedValue) { _, _ in markDirty() }
-        }
-    }
-
     @ViewBuilder
     private func outcomeBadge(_ outcome: EndpointProbeOutcome?) -> some View {
         if let outcome {
-            if outcome.reachable {
-                let code = outcome.statusCode.map(String.init) ?? "OK"
-                Text("\(code) · \(outcome.elapsedMs)ms")
-                    .font(.caption2.monospacedDigit().weight(.medium))
-                    .foregroundStyle(.green)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(Color.green.opacity(0.14), in: Capsule())
-                    .frame(minWidth: 82)
-            } else {
-                Text("不可达")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(Color.red.opacity(0.14), in: Capsule())
-                    .frame(minWidth: 82)
-                    .help(outcome.errorMessage ?? "探测失败")
-            }
+            let tint: Color = outcome.reachable ? .green : .red
+            Text(outcome.reachable ? "\(outcome.statusCode.map(String.init) ?? "OK") · \(outcome.elapsedMs)ms" : "不可达")
+                .font(.caption2.monospacedDigit().weight(.medium))
+                .foregroundStyle(tint)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(tint.opacity(0.14), in: Capsule())
+                .frame(minWidth: 82)
+                .help(outcome.reachable ? "" : (outcome.errorMessage ?? "探测失败"))
         } else {
             Text("待探测")
                 .font(.caption2)
@@ -283,15 +250,15 @@ struct WatchdogView: View {
 
                 Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 8) {
                     GridRow {
-                        numberInput("持续异常多久才重连 (s)", value: $draftConfig.failureWindowSec, range: 10...600)
-                        numberInput("确认期复检间隔 (s)", value: $draftConfig.recheckIntervalSec, range: 1...60)
+                        numberInput("持续异常多久才重连 (s)", value: $draftConfig.failureWindowSec, range: WatchdogConfig.failureWindowRange)
+                        numberInput("确认期复检间隔 (s)", value: $draftConfig.recheckIntervalSec, range: WatchdogConfig.recheckIntervalRange)
                     }
                     GridRow {
-                        numberInput("重连后保护期 (s)", value: $draftConfig.postReconnectGraceSec, range: 0...600)
-                        numberInput("连续重连上限 (次)", value: $draftConfig.maxConsecutiveReconnects, range: 1...10)
+                        numberInput("重连后保护期 (s)", value: $draftConfig.postReconnectGraceSec, range: WatchdogConfig.postReconnectGraceRange)
+                        numberInput("连续重连上限 (次)", value: $draftConfig.maxConsecutiveReconnects, range: WatchdogConfig.maxConsecutiveReconnectsRange)
                     }
                     GridRow {
-                        numberInput("触发上限后冷却 (s)", value: $draftConfig.cooldownSec, range: 10...600)
+                        numberInput("触发上限后冷却 (s)", value: $draftConfig.cooldownSec, range: WatchdogConfig.cooldownRange)
                     }
                 }
 
@@ -321,15 +288,16 @@ struct WatchdogView: View {
         }
     }
 
-    private func numberInput(_ label: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {
-        HStack(spacing: 8) {
+    /// `fieldWidth` is set for the compact per-endpoint inputs; the default lays out the aligned parameter grid.
+    private func numberInput(_ label: String, value: Binding<Int>, range: ClosedRange<Int>, fieldWidth: CGFloat? = nil) -> some View {
+        HStack(spacing: fieldWidth == nil ? 8 : 6) {
             Text(label + ":")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .frame(width: 168, alignment: .leading)
+                .frame(width: fieldWidth == nil ? 168 : nil, alignment: .leading)
             TextField("", value: value, format: .number)
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 72)
+                .frame(width: fieldWidth ?? 72)
                 .onChange(of: value.wrappedValue) { _, _ in markDirty() }
                 .onSubmit { applyDraftConfig() }
             Stepper("", value: value, in: range)

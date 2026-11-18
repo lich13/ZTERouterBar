@@ -9,8 +9,6 @@ public final class URLEndpointProber: EndpointProbing, @unchecked Sendable {
 
     public init() {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 35
-        config.timeoutIntervalForResource = 35
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.urlCache = nil
         config.httpShouldSetCookies = false
@@ -28,7 +26,7 @@ public final class URLEndpointProber: EndpointProbing, @unchecked Sendable {
             return makeOutcome(endpoint, urlString: endpoint.urlString, reachable: false, errorMessage: "URL 格式无效（需 http/https）")
         }
 
-        let timeoutSec = min(max(endpoint.timeoutSec, 1), 30)
+        let timeoutSec = endpoint.timeoutSec
         var request = URLRequest(
             url: url,
             cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
@@ -40,12 +38,11 @@ public final class URLEndpointProber: EndpointProbing, @unchecked Sendable {
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         request.setValue("close", forHTTPHeaderField: "Connection")
 
-        let clock = ContinuousClock()
-        let start = clock.now
+        let start = ContinuousClock.now
+        var elapsedMs: Int { durationMillis(start.duration(to: .now)) }
 
         do {
             let response = try await fetchResponseWithHardTimeout(request: request, timeoutSec: timeoutSec)
-            let elapsedMs = durationMillis(start.duration(to: clock.now))
             guard let http = response as? HTTPURLResponse else {
                 return makeOutcome(endpoint, urlString: trimmedURL, reachable: false, elapsedMs: elapsedMs, errorMessage: "非 HTTP 响应")
             }
@@ -54,10 +51,8 @@ public final class URLEndpointProber: EndpointProbing, @unchecked Sendable {
             }
             return makeOutcome(endpoint, urlString: trimmedURL, reachable: true, statusCode: http.statusCode, elapsedMs: elapsedMs)
         } catch is ProbeTimeoutError {
-            let elapsedMs = durationMillis(start.duration(to: clock.now))
             return makeOutcome(endpoint, urlString: trimmedURL, reachable: false, elapsedMs: elapsedMs, errorMessage: "请求超时 (\(timeoutSec)s)")
         } catch {
-            let elapsedMs = durationMillis(start.duration(to: clock.now))
             return makeOutcome(endpoint, urlString: trimmedURL, reachable: false, elapsedMs: elapsedMs, errorMessage: error.localizedDescription)
         }
     }

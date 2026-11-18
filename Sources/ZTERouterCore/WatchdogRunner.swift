@@ -12,8 +12,8 @@ extension ZTERouterClient: RouterReconnecting {
 
 public enum WatchdogEvaluator {
     public static func weightTally(outcomes: [EndpointProbeOutcome]) -> (reachable: Int, total: Int) {
-        let total = outcomes.reduce(0) { $0 + max(1, $1.weight) }
-        let reachable = outcomes.filter(\.reachable).reduce(0) { $0 + max(1, $1.weight) }
+        let total = outcomes.reduce(0) { $0 + $1.weight }
+        let reachable = outcomes.filter(\.reachable).reduce(0) { $0 + $1.weight }
         return (reachable, total)
     }
 
@@ -40,6 +40,30 @@ public enum WatchdogEvaluator {
             let codeText = outcome.statusCode.map { " HTTP \($0)" } ?? ""
             return "不可达  \(outcome.name)\(weightTag)  \(outcome.elapsedMs)ms\(codeText)\(errText)"
         }
+    }
+}
+
+extension WatchdogEvaluator {
+    /// Per-endpoint lines for the endpoints probed this round, followed by the verdict over `snapshot`.
+    public static func roundLogEntries(
+        probed: [EndpointProbeOutcome],
+        snapshot: [EndpointProbeOutcome],
+        policy: WatchdogTriggerPolicy,
+        healthy: Bool,
+        verdictLabel: String
+    ) -> [WatchdogLogEntry] {
+        var entries = probed.map {
+            WatchdogLogEntry(level: $0.reachable ? .info : .warning, message: "  \(formatProbeSummary($0))")
+        }
+        let verdict: String
+        if policy == .weighted {
+            let tally = weightTally(outcomes: snapshot)
+            verdict = (healthy ? "网络正常" : "未达到权重阈值") + "（可达权重 \(tally.reachable)/\(tally.total)）"
+        } else {
+            verdict = healthy ? "网络正常" : "未达到可达条件"
+        }
+        entries.append(WatchdogLogEntry(level: healthy ? .success : .warning, message: "==> \(verdictLabel)：\(verdict)"))
+        return entries
     }
 }
 
@@ -96,6 +120,7 @@ public struct WatchdogRunner: Sendable {
         )))
         await onEvent(.phaseChanged(.monitoring))
 
+        let minIntervalSec = endpoints.map(\.intervalSec).min() ?? 15
         var consecutiveReconnects = 0
         var notifiedThisOutage = false
         var latestByID: [UUID: EndpointProbeOutcome] = [:]
@@ -164,7 +189,7 @@ public struct WatchdogRunner: Sendable {
                 guard config.autoReconnectEnabled else {
                     await onEvent(.phaseChanged(.paused(reason: "外网持续异常，自动重连未开启")))
                     await onEvent(.log(WatchdogLogEntry(level: .warning, message: "持续 \(failingSec)s 检测不可达；自动重连未开启，仅通知，继续监测")))
-                    try await pause(seconds: endpoints.map(\.intervalSec).min() ?? 15, endpoints: endpoints, nextDueSec: &nextDueSec, timelineSec: &timelineSec)
+                    try await pause(seconds: minIntervalSec, endpoints: endpoints, nextDueSec: &nextDueSec, timelineSec: &timelineSec)
                     continue
                 }
 
@@ -172,7 +197,7 @@ public struct WatchdogRunner: Sendable {
                 if let pauseReason = await canReconnect?() {
                     await onEvent(.phaseChanged(.paused(reason: pauseReason)))
                     await onEvent(.log(WatchdogLogEntry(level: .warning, message: "暂停重连：\(pauseReason)")))
-                    try await pause(seconds: endpoints.map(\.intervalSec).min() ?? 15, endpoints: endpoints, nextDueSec: &nextDueSec, timelineSec: &timelineSec)
+                    try await pause(seconds: minIntervalSec, endpoints: endpoints, nextDueSec: &nextDueSec, timelineSec: &timelineSec)
                     continue
                 }
 
@@ -197,7 +222,7 @@ public struct WatchdogRunner: Sendable {
                         let reason = routerError.localizedDescription
                         await onEvent(.phaseChanged(.paused(reason: reason)))
                         await onEvent(.log(WatchdogLogEntry(level: .error, message: "无法执行重连：\(reason)")))
-                        try await pause(seconds: max(endpoints.map(\.intervalSec).min() ?? 20, 20), endpoints: endpoints, nextDueSec: &nextDueSec, timelineSec: &timelineSec)
+                        try await pause(seconds: max(minIntervalSec, 20), endpoints: endpoints, nextDueSec: &nextDueSec, timelineSec: &timelineSec)
                         continue
                     default:
                         await onEvent(.log(WatchdogLogEntry(level: .error, message: "路由器重连异常：\(routerError.localizedDescription)")))
@@ -271,24 +296,10 @@ public struct WatchdogRunner: Sendable {
         onEvent: @escaping @Sendable (WatchdogEvent) async -> Void
     ) async {
         await onEvent(.probeRoundCompleted(snapshotOutcomes, overallHealthy: healthy))
-        for outcome in probedOutcomes {
-            await onEvent(.log(WatchdogLogEntry(
-                level: outcome.reachable ? .info : .warning,
-                message: "  \(WatchdogEvaluator.formatProbeSummary(outcome))"
-            )))
+        for entry in WatchdogEvaluator.roundLogEntries(
+            probed: probedOutcomes, snapshot: snapshotOutcomes, policy: policy, healthy: healthy, verdictLabel: "本轮判定"
+        ) {
+            await onEvent(.log(entry))
         }
-        let verdict: String
-        if policy == .weighted {
-            let tally = WatchdogEvaluator.weightTally(outcomes: snapshotOutcomes)
-            verdict = healthy
-                ? "==> 本轮判定：网络正常（可达权重 \(tally.reachable)/\(tally.total)）"
-                : "==> 本轮判定：未达到权重阈值（可达权重 \(tally.reachable)/\(tally.total)）"
-        } else {
-            verdict = healthy ? "==> 本轮判定：网络正常" : "==> 本轮判定：未达到可达条件"
-        }
-        await onEvent(.log(WatchdogLogEntry(
-            level: healthy ? .success : .warning,
-            message: verdict
-        )))
     }
 }
