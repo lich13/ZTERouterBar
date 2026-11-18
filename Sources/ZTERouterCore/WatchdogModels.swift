@@ -419,5 +419,6 @@ public enum WatchdogEvent: Sendable {
     case probeFailureDetected(reason: String)
     case autoReconnectTriggered(reason: String)
     case autoReconnectFinished(state: WANConnectionState)
+    case autoReconnectFailed(reason: String)
     case log(WatchdogLogEntry)
 }

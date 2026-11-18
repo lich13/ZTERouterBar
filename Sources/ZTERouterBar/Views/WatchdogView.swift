@@ -15,12 +15,19 @@ struct WatchdogView: View {
         return f
     }()
 
+    private static let reconnectTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm:ss"
+        return f
+    }()
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 controlHeaderCard
                 endpointsCard
                 policyAndTimingCard
+                reconnectLogCard
                 logCard
             }
             .padding(16)
@@ -308,43 +315,79 @@ struct WatchdogView: View {
 
     // MARK: - Live Log
 
+    private var reconnectLogCard: some View {
+        logListCard(
+            title: "重连记录",
+            entries: viewModel.reconnectLogs,
+            emptyText: "暂无重连记录。自动与手动重连的触发原因、结果与 IP 变化会记录在这里。",
+            timeFormatter: Self.reconnectTimeFormatter,
+            height: 120
+        ) { EmptyView() }
+    }
+
     private var logCard: some View {
+        logListCard(
+            title: "保活运行日志",
+            entries: viewModel.watchdogLogs,
+            emptyText: "暂无日志。点击「启动守护」或「立即探测一次」开始监测。",
+            timeFormatter: Self.logTimeFormatter,
+            height: 200
+        ) {
+            Button("清空") {
+                viewModel.clearWatchdogLogs()
+            }
+            .controlSize(.small)
+            .disabled(viewModel.watchdogLogs.isEmpty)
+        }
+    }
+
+    private func logListCard(
+        title: String,
+        entries: [WatchdogLogEntry],
+        emptyText: String,
+        timeFormatter: DateFormatter,
+        height: CGFloat,
+        @ViewBuilder extraButtons: () -> some View
+    ) -> some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text("保活运行日志 (\(viewModel.watchdogLogs.count))")
+                    Text("\(title) (\(entries.count))")
                         .font(.subheadline.weight(.semibold))
                     Spacer()
-                    Button("复制日志") {
-                        let text = viewModel.watchdogLogs.map {
-                            "\(Self.logTimeFormatter.string(from: $0.timestamp))  \($0.message)"
+                    Button("打开日志目录") {
+                        try? FileManager.default.createDirectory(at: RouterViewModel.logDirectory, withIntermediateDirectories: true)
+                        NSWorkspace.shared.open(RouterViewModel.logDirectory)
+                    }
+                    .controlSize(.small)
+                    .help("运行日志按天存档并只保留最近 3 天；重连记录单独保存在 reconnect.log")
+
+                    Button("复制") {
+                        let text = entries.map {
+                            "\(timeFormatter.string(from: $0.timestamp))  \($0.message)"
                         }.joined(separator: "\n")
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(text, forType: .string)
-                        viewModel.showToast("已复制日志")
+                        viewModel.showToast("已复制\(title)")
                     }
                     .controlSize(.small)
-                    .disabled(viewModel.watchdogLogs.isEmpty)
+                    .disabled(entries.isEmpty)
 
-                    Button("清空") {
-                        viewModel.clearWatchdogLogs()
-                    }
-                    .controlSize(.small)
-                    .disabled(viewModel.watchdogLogs.isEmpty)
+                    extraButtons()
                 }
 
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 3) {
-                            if viewModel.watchdogLogs.isEmpty {
-                                Text("暂无日志。点击「启动守护」或「立即探测一次」开始监测。")
+                            if entries.isEmpty {
+                                Text(emptyText)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .padding(8)
                             } else {
-                                ForEach(viewModel.watchdogLogs) { entry in
+                                ForEach(entries) { entry in
                                     HStack(alignment: .top, spacing: 8) {
-                                        Text(Self.logTimeFormatter.string(from: entry.timestamp))
+                                        Text(timeFormatter.string(from: entry.timestamp))
                                             .font(.system(.caption2, design: .monospaced))
                                             .foregroundStyle(.secondary)
                                         Text(entry.message)
@@ -359,9 +402,9 @@ struct WatchdogView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(8)
                     }
-                    .frame(height: 200)
+                    .frame(height: height)
                     .background(Color(nsColor: .textBackgroundColor).opacity(0.65), in: RoundedRectangle(cornerRadius: 8))
-                    .onChange(of: viewModel.watchdogLogs.last?.id) { _, lastID in
+                    .onChange(of: entries.last?.id, initial: true) { _, lastID in
                         if let lastID {
                             proxy.scrollTo(lastID, anchor: .bottom)
                         }

@@ -694,6 +694,30 @@ struct ZTERouterCoreTests {
         #expect(manualUnchanged.body.contains("10.10.0.1（未变化）"))
     }
 
+    @Test("Log files round-trip entries, and daily files older than the retention window are deleted")
+    func testLogFileStoreRetention() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("zte-log-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let now = Date()
+        let day: TimeInterval = 86_400
+
+        let rolling = LogFileStore(directory: dir, name: "watchdog", retentionDays: 3)
+        rolling.append(WatchdogLogEntry(timestamp: now.addingTimeInterval(-5 * day), level: .info, message: "old"))
+        rolling.append(WatchdogLogEntry(timestamp: now.addingTimeInterval(-2 * day), level: .warning, message: "kept\nline"))
+        rolling.append(WatchdogLogEntry(timestamp: now, level: .error, message: "new\twith tab"))
+        let kept = rolling.recentEntries(limit: 10)
+        #expect(kept.map(\.message) == ["kept line", "new\twith tab"])
+        #expect(kept.map(\.level) == [.warning, .error])
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).count == 2)
+        #expect(rolling.recentEntries(limit: 1).map(\.message) == ["new\twith tab"])
+
+        let single = LogFileStore(directory: dir, name: "reconnect")
+        single.append(WatchdogLogEntry(timestamp: now.addingTimeInterval(-30 * day), message: "ancient"))
+        single.append(WatchdogLogEntry(timestamp: now, message: "recent"))
+        #expect(single.recentEntries(limit: 10).map(\.message) == ["ancient", "recent"])
+        #expect(FileManager.default.fileExists(atPath: dir.appendingPathComponent("reconnect.log").path))
+    }
+
     @Test("URLEndpointProber rejects invalid URL and interprets HTTP gateway failure codes")
     func testProberValidation() async {
         let prober = URLEndpointProber()

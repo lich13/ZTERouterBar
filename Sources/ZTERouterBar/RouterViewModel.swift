@@ -43,6 +43,8 @@ final class RouterViewModel {
     var watchdogPhase: WatchdogPhase = .idle
     var lastProbeOutcomes: [EndpointProbeOutcome] = []
     var watchdogLogs: [WatchdogLogEntry] = []
+    /// Reconnect history (automatic and manual), persisted separately from the rolling watchdog log.
+    var reconnectLogs: [WatchdogLogEntry] = []
     var isProbingOnce: Bool = false
 
     var lastError: String?
@@ -68,6 +70,12 @@ final class RouterViewModel {
     private let prober: any EndpointProbing = URLEndpointProber()
     private let watchdogRunner = WatchdogRunner()
 
+    static let logDirectory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/ZTERouterBar", isDirectory: true)
+    private static let reconnectLogLimit = 200
+    private let watchdogLogFile = LogFileStore(directory: RouterViewModel.logDirectory, name: "watchdog", retentionDays: 3)
+    private let reconnectLogFile = LogFileStore(directory: RouterViewModel.logDirectory, name: "reconnect")
+
     init(
         settings: SettingsStore = SettingsStore(),
         wifiMonitor: WiFiNetworkMonitor = WiFiNetworkMonitor(),
@@ -76,6 +84,7 @@ final class RouterViewModel {
         self.settings = settings
         self.wifiMonitor = wifiMonitor
         self.notifier = notifier
+        self.reconnectLogs = reconnectLogFile.recentEntries(limit: Self.reconnectLogLimit)
 
         wifiMonitor.onSSIDChanged = { [weak self] ssid in
             self?.handleWiFiSSIDChanged(ssid)
@@ -302,9 +311,12 @@ final class RouterViewModel {
                     willAutoReconnect: settings.watchdogConfig.autoReconnectEnabled
                 )
             }
+        case let .autoReconnectFailed(reason):
+            appendReconnectLog(.error, "自动重连失败：\(reason)")
         case let .autoReconnectTriggered(reason):
             handledAutoReconnectFinish = false
             pendingAutoBeforeIP = WANIPSnapshot(snapshot: snapshot)
+            appendReconnectLog(.warning, "自动重连触发：\(reason)")
             if settings.systemNotificationsEnabled {
                 notifier.notifyAutoReconnectTriggered(
                     profileName: activeProfile.name,
@@ -323,7 +335,17 @@ final class RouterViewModel {
         }
     }
 
+    private func appendReconnectLog(_ level: WatchdogLogLevel, _ message: String) {
+        let entry = WatchdogLogEntry(level: level, message: "「\(activeProfile.name)」\(message)")
+        reconnectLogFile.append(entry)
+        reconnectLogs.append(entry)
+        if reconnectLogs.count > Self.reconnectLogLimit {
+            reconnectLogs.removeFirst(reconnectLogs.count - Self.reconnectLogLimit)
+        }
+    }
+
     private func appendWatchdogLog(_ entry: WatchdogLogEntry) {
+        watchdogLogFile.append(entry)
         watchdogLogs.append(entry)
         if watchdogLogs.count > 300 {
             watchdogLogs.removeFirst(watchdogLogs.count - 300)
@@ -563,6 +585,7 @@ final class RouterViewModel {
             manualReconnectGraceUntil = Date().addingTimeInterval(TimeInterval(settings.watchdogConfig.postReconnectGraceSec))
         }
         lastError = nil
+        appendReconnectLog(.info, "手动重连触发")
 
         var beforeIP = WANIPSnapshot(snapshot: snapshot)
         if beforeIP.isEmpty {
@@ -585,8 +608,10 @@ final class RouterViewModel {
                 isSessionOccupied = true
             }
             lastError = routerError.localizedDescription
+            appendReconnectLog(.error, "手动重连失败：\(routerError.localizedDescription)")
         } catch {
             lastError = error.localizedDescription
+            appendReconnectLog(.error, "手动重连失败：\(error.localizedDescription)")
         }
     }
 
@@ -622,6 +647,10 @@ final class RouterViewModel {
         if isAutomatic {
             appendWatchdogLog(WatchdogLogEntry(level: .info, message: "重连 IP 对比：\(summary)"))
         }
+        appendReconnectLog(
+            state.isConnected ? .success : .warning,
+            "\(isAutomatic ? "自动" : "手动")重连完成：\(state.localizedLabel)；IP 对比：\(summary)"
+        )
 
         if settings.systemNotificationsEnabled {
             notifier.notifyReconnectIPChange(

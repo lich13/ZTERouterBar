@@ -221,15 +221,18 @@ public struct WatchdogRunner: Sendable {
                         // Retrying cannot help until the user fixes the session or credentials.
                         let reason = routerError.localizedDescription
                         await onEvent(.phaseChanged(.paused(reason: reason)))
+                        await onEvent(.autoReconnectFailed(reason: reason))
                         await onEvent(.log(WatchdogLogEntry(level: .error, message: "无法执行重连：\(reason)")))
                         try await pause(seconds: max(minIntervalSec, 20), endpoints: endpoints, nextDueSec: &nextDueSec, timelineSec: &timelineSec)
                         continue
                     default:
+                        await onEvent(.autoReconnectFailed(reason: routerError.localizedDescription))
                         await onEvent(.log(WatchdogLogEntry(level: .error, message: "路由器重连异常：\(routerError.localizedDescription)")))
                     }
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
+                    await onEvent(.autoReconnectFailed(reason: error.localizedDescription))
                     await onEvent(.log(WatchdogLogEntry(level: .error, message: "重连异常：\(error.localizedDescription)")))
                 }
 
