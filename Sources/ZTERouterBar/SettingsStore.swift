@@ -29,10 +29,13 @@ final class SettingsStore {
         static let menuBarDisplayStyle = "zte.router.menuBarDisplayStyle"
         static let globalShortcutEnabled = "zte.router.globalShortcutEnabled"
         static let watchdogConfig = "zte.router.watchdogConfig.v1"
+        static let watchdogDefaultsVersion = "zte.router.watchdogDefaultsVersion"
         // Legacy single-profile keys for migration
         static let legacyRouterURL = "zte.router.url"
         static let legacyHashPreference = "zte.router.hashPreference"
     }
+
+    private static let currentWatchdogDefaultsVersion = 2
 
     var profiles: [RouterProfile] {
         didSet { saveProfiles() }
@@ -120,11 +123,15 @@ final class SettingsStore {
                     decodedWD.endpoints[idx].proxyPassword = proxyPass
                 }
             }
+            if defaults.integer(forKey: Keys.watchdogDefaultsVersion) < Self.currentWatchdogDefaultsVersion {
+                decodedWD = decodedWD.migratingLegacyV102Defaults()
+            }
             self.watchdogConfig = decodedWD.clamped()
         } else {
             self.watchdogConfig = WatchdogConfig()
         }
 
+        defaults.set(Self.currentWatchdogDefaultsVersion, forKey: Keys.watchdogDefaultsVersion)
         saveProfiles()
         saveWatchdogConfig()
         defaults.set(activeProfileID.uuidString, forKey: Keys.activeProfileID)

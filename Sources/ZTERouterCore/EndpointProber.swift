@@ -108,7 +108,8 @@ public struct URLEndpointProber: EndpointProbing {
                     errorMessage: "非 HTTP 响应"
                 )
             }
-            if http.statusCode == 407 {
+            let gatewayError = Self.failureMessage(forStatusCode: http.statusCode)
+            if let gatewayError {
                 return EndpointProbeOutcome(
                     id: endpoint.id,
                     name: endpoint.displayTitle,
@@ -117,7 +118,7 @@ public struct URLEndpointProber: EndpointProbing {
                     reachable: false,
                     statusCode: http.statusCode,
                     elapsedMs: elapsedMs,
-                    errorMessage: "代理需要认证 (407)"
+                    errorMessage: gatewayError
                 )
             }
             return EndpointProbeOutcome(
@@ -140,6 +141,18 @@ public struct URLEndpointProber: EndpointProbing {
                 elapsedMs: elapsedMs,
                 errorMessage: error.localizedDescription
             )
+        }
+    }
+
+    /// Interprets HTTP proxy/gateway failure codes (e.g. local proxy returning 502/504 when tunnel fails) as unreachable.
+    public static func failureMessage(forStatusCode statusCode: Int) -> String? {
+        switch statusCode {
+        case 407:
+            return "代理需要认证 (407)"
+        case 502, 503, 504:
+            return "代理/网关不可达 (HTTP \(statusCode))"
+        default:
+            return nil
         }
     }
 

@@ -241,13 +241,40 @@ struct ZTERouterCoreTests {
         }
     }
 
-    @Test("Watchdog config defaults, presets, and trigger policy evaluation")
+    @Test("Watchdog config defaults, presets, legacy migration, and trigger policy evaluation")
     func testWatchdogConfigAndPolicies() {
         let cfg = WatchdogConfig()
         #expect(cfg.autoStart == true)
         #expect(cfg.triggerPolicy == .allUnreachable)
-        #expect(cfg.endpoints.count == 3)
-        #expect(cfg.endpoints.allSatisfy { $0.isValidHTTPURL && $0.proxyMode == .system })
+        #expect(cfg.checkTimeoutMs == 4000)
+        #expect(cfg.pollIntervalSec == 33)
+        #expect(cfg.recheckBeforeAct == 3)
+        #expect(cfg.recheckIntervalSec == 3)
+        #expect(cfg.endpoints.count == 4)
+        #expect(cfg.endpoints.allSatisfy {
+            $0.isValidHTTPURL
+                && $0.urlString.hasPrefix("https://")
+                && $0.proxyMode == .system
+                && $0.proxyHost == "127.0.0.1"
+                && $0.proxyPort == 7890
+        })
+        #expect(!cfg.endpoints.contains(where: { $0.urlString.contains("captive.apple.com") }))
+
+        let legacyUntouched = WatchdogConfig(
+            pollIntervalSec: 15,
+            endpoints: WatchdogEndpoint.legacyV102PresetURLs.map { WatchdogEndpoint(name: "Legacy", urlString: $0) }
+        )
+        let migrated = legacyUntouched.migratingLegacyV102Defaults()
+        #expect(migrated.pollIntervalSec == 33)
+        #expect(migrated.endpoints.map(\.urlString) == WatchdogEndpoint.defaultPresets.map(\.urlString))
+
+        let userCustom = WatchdogConfig(
+            pollIntervalSec: 20,
+            endpoints: [WatchdogEndpoint(name: "Custom", urlString: "https://example.invalid")]
+        )
+        let kept = userCustom.migratingLegacyV102Defaults()
+        #expect(kept.pollIntervalSec == 20)
+        #expect(kept.endpoints.map(\.urlString) == ["https://example.invalid"])
 
         let ok = EndpointProbeOutcome(id: UUID(), name: "A", urlString: "https://example.invalid", proxyMode: .system, reachable: true, statusCode: 204, elapsedMs: 50)
         let fail = EndpointProbeOutcome(id: UUID(), name: "B", urlString: "https://example.invalid", proxyMode: .system, reachable: false, errorMessage: "timeout")
@@ -334,6 +361,14 @@ struct ZTERouterCoreTests {
         let out2 = await prober.check(badProxy, timeoutMs: 1000)
         #expect(out2.reachable == false)
         #expect(out2.errorMessage?.contains("SOCKS5") == true)
+
+        #expect(URLEndpointProber.failureMessage(forStatusCode: 200) == nil)
+        #expect(URLEndpointProber.failureMessage(forStatusCode: 204) == nil)
+        #expect(URLEndpointProber.failureMessage(forStatusCode: 301) == nil)
+        #expect(URLEndpointProber.failureMessage(forStatusCode: 407) != nil)
+        #expect(URLEndpointProber.failureMessage(forStatusCode: 502) != nil)
+        #expect(URLEndpointProber.failureMessage(forStatusCode: 503) != nil)
+        #expect(URLEndpointProber.failureMessage(forStatusCode: 504) != nil)
     }
 }
 

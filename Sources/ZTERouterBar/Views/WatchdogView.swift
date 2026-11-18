@@ -151,7 +151,7 @@ struct WatchdogView: View {
                     .onChange(of: epVal.name) { _, _ in markDirty() }
                     .onSubmit { applyDraftConfig() }
 
-                TextField("检测链接 (http/https)", text: endpoint.urlString, prompt: Text("https://cp.cloudflare.com/generate_204"))
+                TextField("检测链接 (http/https)", text: endpoint.urlString, prompt: Text("https://www.youtube.com/generate_204"))
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
                     .onChange(of: epVal.urlString) { _, _ in markDirty() }
@@ -276,6 +276,12 @@ struct WatchdogView: View {
                 }
 
                 HStack {
+                    Button("恢复默认参数") {
+                        draftConfig = draftConfig.withDefaultParameters()
+                        applyDraftConfig()
+                    }
+                    .controlSize(.small)
+
                     Spacer()
                     Button("保存并应用参数") {
                         applyDraftConfig()

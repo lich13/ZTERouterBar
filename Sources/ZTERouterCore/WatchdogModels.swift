@@ -58,7 +58,7 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
         name: String = "",
         urlString: String = "",
         proxyMode: EndpointProxyMode = .system,
-        proxyHost: String = "",
+        proxyHost: String = "127.0.0.1",
         proxyPort: Int = 7890,
         proxyUsername: String = "",
         proxyPassword: String = ""
@@ -94,24 +94,39 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
         return urlString.isEmpty ? "未命名端点" : urlString
     }
 
+    /// URLs shipped in v1.0.2 before GFW-ruleset alignment, used only for one-time migration of untouched configs.
+    public static let legacyV102PresetURLs: [String] = [
+        "https://cp.cloudflare.com/generate_204",
+        "https://www.gstatic.com/generate_204",
+        "https://captive.apple.com/hotspot-detect.html"
+    ]
+
+    /// Cross-provider lightweight HTTPS endpoints verified in GFWList (`gfw.txt`) and excluded from mainland direct rules (`direct.txt`),
+    /// preventing mainland CDN/direct bypasses from masking overseas/proxy throttling under `allUnreachable`.
     public static var defaultPresets: [WatchdogEndpoint] {
         [
             WatchdogEndpoint(
                 isEnabled: true,
-                name: "Cloudflare 204",
-                urlString: "https://cp.cloudflare.com/generate_204",
+                name: "YouTube 204",
+                urlString: "https://www.youtube.com/generate_204",
                 proxyMode: .system
             ),
             WatchdogEndpoint(
                 isEnabled: true,
-                name: "Google 204",
-                urlString: "https://www.gstatic.com/generate_204",
+                name: "Cloudflare DoH",
+                urlString: "https://cloudflare-dns.com/cdn-cgi/trace",
                 proxyMode: .system
             ),
             WatchdogEndpoint(
                 isEnabled: true,
-                name: "Apple Captive",
-                urlString: "https://captive.apple.com/hotspot-detect.html",
+                name: "GitHub Assets",
+                urlString: "https://github.githubassets.com/favicons/favicon.svg",
+                proxyMode: .system
+            ),
+            WatchdogEndpoint(
+                isEnabled: true,
+                name: "Dropbox",
+                urlString: "https://www.dropbox.com/robots.txt",
                 proxyMode: .system
             )
         ]
@@ -130,14 +145,21 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
     public var onlyWhenWiFiMatched: Bool
     public var endpoints: [WatchdogEndpoint]
 
+    public static let defaultCheckTimeoutMs = 4000
+    public static let defaultPollIntervalSec = 33
+    public static let defaultRecheckBeforeAct = 3
+    public static let defaultRecheckIntervalSec = 3
+    public static let defaultMaxConsecutiveReconnects = 3
+    public static let defaultCooldownSec = 60
+
     public init(
         autoStart: Bool = true,
-        checkTimeoutMs: Int = 4000,
-        pollIntervalSec: Int = 15,
-        recheckBeforeAct: Int = 3,
-        recheckIntervalSec: Int = 3,
-        maxConsecutiveReconnects: Int = 3,
-        cooldownSec: Int = 60,
+        checkTimeoutMs: Int = WatchdogConfig.defaultCheckTimeoutMs,
+        pollIntervalSec: Int = WatchdogConfig.defaultPollIntervalSec,
+        recheckBeforeAct: Int = WatchdogConfig.defaultRecheckBeforeAct,
+        recheckIntervalSec: Int = WatchdogConfig.defaultRecheckIntervalSec,
+        maxConsecutiveReconnects: Int = WatchdogConfig.defaultMaxConsecutiveReconnects,
+        cooldownSec: Int = WatchdogConfig.defaultCooldownSec,
         triggerPolicy: WatchdogTriggerPolicy = .allUnreachable,
         onlyWhenWiFiMatched: Bool = false,
         endpoints: [WatchdogEndpoint] = WatchdogEndpoint.defaultPresets
@@ -169,6 +191,34 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
         copy.maxConsecutiveReconnects = min(max(maxConsecutiveReconnects, 1), 10)
         copy.cooldownSec = min(max(cooldownSec, 10), 600)
         return copy
+    }
+
+    /// One-time migration from v1.0.2 untouched defaults to GFW-aligned presets and 33s polling interval.
+    public func migratingLegacyV102Defaults() -> WatchdogConfig {
+        var copy = self
+        if copy.endpoints.map(\.urlString) == WatchdogEndpoint.legacyV102PresetURLs {
+            copy.endpoints = WatchdogEndpoint.defaultPresets
+        }
+        if copy.pollIntervalSec == 15 {
+            copy.pollIntervalSec = WatchdogConfig.defaultPollIntervalSec
+        }
+        return copy.clamped()
+    }
+
+    /// Returns a copy keeping current endpoints while restoring all strategy and timing parameters to recommended defaults.
+    public func withDefaultParameters() -> WatchdogConfig {
+        WatchdogConfig(
+            autoStart: true,
+            checkTimeoutMs: WatchdogConfig.defaultCheckTimeoutMs,
+            pollIntervalSec: WatchdogConfig.defaultPollIntervalSec,
+            recheckBeforeAct: WatchdogConfig.defaultRecheckBeforeAct,
+            recheckIntervalSec: WatchdogConfig.defaultRecheckIntervalSec,
+            maxConsecutiveReconnects: WatchdogConfig.defaultMaxConsecutiveReconnects,
+            cooldownSec: WatchdogConfig.defaultCooldownSec,
+            triggerPolicy: .allUnreachable,
+            onlyWhenWiFiMatched: false,
+            endpoints: endpoints
+        )
     }
 }
 
