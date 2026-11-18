@@ -22,6 +22,7 @@ struct PopoverView: View {
                 quickSetupCard
             } else {
                 wanHeroCard
+                watchdogStatusCard
                 if let snapshot = viewModel.snapshot {
                     signalSummaryCard(snapshot)
                 } else if viewModel.isRefreshing {
@@ -333,6 +334,76 @@ struct PopoverView: View {
         )
     }
 
+    private var watchdogStatusCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "shield.checkered")
+                    .font(.caption)
+                    .foregroundStyle(viewModel.isWatchdogRunning ? .green : .secondary)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("外网保活守护")
+                        .font(.caption.weight(.semibold))
+                    Text(viewModel.watchdogPhase.displayLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                Button {
+                    onOpenDashboard(.watchdog)
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .help("编辑探测端点与守护参数")
+
+                Toggle("", isOn: Binding(
+                    get: { viewModel.isWatchdogRunning },
+                    set: { on in
+                        if on && !viewModel.isWatchdogRunning {
+                            viewModel.startWatchdog()
+                        } else if !on && viewModel.isWatchdogRunning {
+                            viewModel.stopWatchdog(userInitiated: true)
+                        }
+                    }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+            }
+
+            if !viewModel.lastProbeOutcomes.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(viewModel.lastProbeOutcomes) { outcome in
+                            HStack(spacing: 4) {
+                                Circle()
+                                    .fill(outcome.reachable ? Color.green : Color.red)
+                                    .frame(width: 6, height: 6)
+                                Text(outcome.name)
+                                    .font(.system(size: 10))
+                                    .lineLimit(1)
+                                Text(outcome.reachable ? "\(outcome.elapsedMs)ms" : "超时")
+                                    .font(.system(size: 10).monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.quaternary.opacity(0.45), in: Capsule())
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
+    }
+
     private func signalSummaryCard(_ snap: RouterStatusSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -419,7 +490,15 @@ struct PopoverView: View {
                 Button {
                     onOpenDashboard(.overview)
                 } label: {
-                    Label("完整控制台", systemImage: "macwindow")
+                    Label("控制台", systemImage: "macwindow")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    onOpenDashboard(.watchdog)
+                } label: {
+                    Label("保活设置", systemImage: "shield.checkered")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -427,7 +506,7 @@ struct PopoverView: View {
                 Button {
                     onOpenSettings()
                 } label: {
-                    Label("配置与设置", systemImage: "gearshape")
+                    Label("配置", systemImage: "gearshape")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)

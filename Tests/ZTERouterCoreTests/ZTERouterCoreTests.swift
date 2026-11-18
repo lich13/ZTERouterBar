@@ -188,12 +188,10 @@ struct ZTERouterCoreTests {
         let config = try RouterEndpointConfig(baseURLString: "http://192.168.8.1", hashPreference: .auto)
         let client = ZTERouterClient(config: config, password: "fixture-password", transport: transport)
 
-        // Background fetch with reclaimIfDuplicate=false hits duplicateUser cleanly
         await #expect(throws: ZTERouterError.duplicateUser) {
             _ = try await client.fetchStatus(reclaimIfDuplicate: false)
         }
 
-        // User-initiated reconnect reclaims via LOGOUT -> LOGIN and recovers even if kicked mid-flight
         let finalState = try await client.reconnectInternet(pauseBetweenDisconnectAndConnect: .milliseconds(10))
         #expect(finalState.isConnected)
 
@@ -240,6 +238,145 @@ struct ZTERouterCoreTests {
 
         await #expect(throws: ZTERouterError.wrongPassword) {
             _ = try await client.fetchStatus()
+        }
+    }
+
+    @Test("Watchdog config defaults, presets, and trigger policy evaluation")
+    func testWatchdogConfigAndPolicies() {
+        let cfg = WatchdogConfig()
+        #expect(cfg.autoStart == true)
+        #expect(cfg.triggerPolicy == .allUnreachable)
+        #expect(cfg.endpoints.count == 3)
+        #expect(cfg.endpoints.allSatisfy { $0.isValidHTTPURL && $0.proxyMode == .system })
+
+        let ok = EndpointProbeOutcome(id: UUID(), name: "A", urlString: "https://example.invalid", proxyMode: .system, reachable: true, statusCode: 204, elapsedMs: 50)
+        let fail = EndpointProbeOutcome(id: UUID(), name: "B", urlString: "https://example.invalid", proxyMode: .system, reachable: false, errorMessage: "timeout")
+
+        #expect(WatchdogEvaluator.isHealthy(outcomes: [ok, fail], policy: .allUnreachable) == true)
+        #expect(WatchdogEvaluator.isHealthy(outcomes: [fail, fail], policy: .allUnreachable) == false)
+        #expect(WatchdogEvaluator.isHealthy(outcomes: [ok, fail], policy: .anyUnreachable) == false)
+        #expect(WatchdogEvaluator.isHealthy(outcomes: [ok, ok], policy: .anyUnreachable) == true)
+    }
+
+    @Test("Watchdog ignores transient jitter when recheck recovers")
+    func testWatchdogJitterRecheckPreventsReconnect() async {
+        // Round 1 fails, Recheck 1 recovers -> zero reconnects
+        let prober = ScriptedProber(roundResults: [false, true, true])
+        let router = MockReconnectRouter()
+        var cfg = WatchdogConfig(recheckBeforeAct: 3)
+        cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid")]
+
+        let runner = WatchdogRunner(sleep: { _ in try await Task.sleep(for: .milliseconds(5)) })
+        let collector = PhaseCollector()
+        let task = Task {
+            await runner.run(config: cfg, prober: prober, router: router) { event in
+                await collector.record(event)
+            }
+        }
+
+        // Wait until at least 3 probe rounds execute
+        for _ in 0..<50 {
+            if await prober.completedRounds >= 3 { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        task.cancel()
+        await task.value
+
+        let reconnects = await router.reconnectCount
+        #expect(reconnects == 0)
+    }
+
+    @Test("Watchdog triggers reconnect after confirmed failure and cools down after repeated failures")
+    func testWatchdogReconnectAndCooldown() async {
+        // 1 initial fail + 2 recheck fails -> reconnect #1 -> post-check fails -> reconnect #2 -> post-check fails -> cooldown -> next round succeeds
+        let prober = ScriptedProber(roundResults: [
+            false, false, false, // initial + 2 rechecks
+            false,               // post reconnect #1 still failing
+            false,               // post reconnect #2 still failing -> cooldown
+            true                 // after cooldown recovered
+        ])
+        let router = MockReconnectRouter()
+        var cfg = WatchdogConfig(recheckBeforeAct: 2, maxConsecutiveReconnects: 2, cooldownSec: 60)
+        cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid")]
+
+        let runner = WatchdogRunner(sleep: { _ in try await Task.sleep(for: .milliseconds(5)) })
+        let collector = PhaseCollector()
+        let task = Task {
+            await runner.run(config: cfg, prober: prober, router: router) { event in
+                await collector.record(event)
+            }
+        }
+
+        for _ in 0..<80 {
+            if await prober.completedRounds >= 6 { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        task.cancel()
+        await task.value
+
+        let reconnects = await router.reconnectCount
+        let phases = await collector.phases
+        #expect(reconnects == 2)
+        #expect(phases.contains(.reconnecting))
+        #expect(phases.contains(.verifyingAfterReconnect))
+        #expect(phases.contains(.coolingDown(seconds: 60)))
+    }
+
+    @Test("URLEndpointProber rejects invalid URL and invalid proxy config immediately")
+    func testProberValidation() async {
+        let prober = URLEndpointProber()
+        let badURL = WatchdogEndpoint(name: "Bad", urlString: "not-a-url")
+        let out1 = await prober.check(badURL, timeoutMs: 1000)
+        #expect(out1.reachable == false)
+        #expect(out1.errorMessage?.isEmpty == false)
+
+        let badProxy = WatchdogEndpoint(name: "BadProxy", urlString: "https://example.invalid", proxyMode: .socks5, proxyHost: "", proxyPort: 1080)
+        let out2 = await prober.check(badProxy, timeoutMs: 1000)
+        #expect(out2.reachable == false)
+        #expect(out2.errorMessage?.contains("SOCKS5") == true)
+    }
+}
+
+private actor ScriptedProber: EndpointProbing {
+    private var roundResults: [Bool]
+    private(set) var completedRounds = 0
+
+    init(roundResults: [Bool]) {
+        self.roundResults = roundResults
+    }
+
+    func check(_ endpoint: WatchdogEndpoint, timeoutMs: Int) async -> EndpointProbeOutcome {
+        let idx = completedRounds
+        completedRounds += 1
+        let ok = idx < roundResults.count ? roundResults[idx] : true
+        return EndpointProbeOutcome(
+            id: endpoint.id,
+            name: endpoint.displayTitle,
+            urlString: endpoint.urlString,
+            proxyMode: endpoint.proxyMode,
+            reachable: ok,
+            statusCode: ok ? 204 : nil,
+            elapsedMs: 12,
+            errorMessage: ok ? nil : "simulated failure"
+        )
+    }
+}
+
+private actor MockReconnectRouter: RouterReconnecting {
+    private(set) var reconnectCount = 0
+
+    func reconnectInternet() async throws -> WANConnectionState {
+        reconnectCount += 1
+        return .connected(rawStatus: "ipv4_ipv6_connected")
+    }
+}
+
+private actor PhaseCollector {
+    private(set) var phases: [WatchdogPhase] = []
+
+    func record(_ event: WatchdogEvent) {
+        if case let .phaseChanged(phase) = event {
+            phases.append(phase)
         }
     }
 }

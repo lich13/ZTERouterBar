@@ -263,11 +263,36 @@ public actor ZTERouterClient {
         let currentDict = try await getRawFields(["ppp_status"], forceMultiData: true)
         let currentState = WANConnectionState(pppStatus: currentDict["ppp_status"] ?? "")
 
-        if !currentState.isDisconnected {
+        if case .disconnecting = currentState {
+            // Wait for an in-progress disconnect to reach terminal `ppp_disconnected` before reconnecting.
+            _ = try await waitForWANState(targetConnected: false, timeoutSec: 12)
+            try await Task.sleep(for: pauseBetweenDisconnectAndConnect)
+        } else if !currentState.isDisconnected {
             _ = try await setInternetConnected(false, waitUntilSettled: true)
             try await Task.sleep(for: pauseBetweenDisconnectAndConnect)
         }
-        return try await setInternetConnected(true, waitUntilSettled: true)
+
+        let connectedState = try await setInternetConnected(true, waitUntilSettled: true)
+        if connectedState.isDisconnected {
+            // Retry CONNECT_NETWORK once if modem settled in disconnected after a rapid cycle.
+            try await Task.sleep(for: pauseBetweenDisconnectAndConnect)
+            return try await setInternetConnected(true, waitUntilSettled: true)
+        }
+        return connectedState
+    }
+
+    private func waitForWANState(targetConnected: Bool, timeoutSec: TimeInterval) async throws -> WANConnectionState {
+        let deadline = Date().addingTimeInterval(timeoutSec)
+        while Date() < deadline {
+            try Task.checkCancellation()
+            let stateDict = try await getRawFields(["ppp_status"], forceMultiData: true)
+            let state = WANConnectionState(pppStatus: stateDict["ppp_status"] ?? "")
+            if targetConnected && state.isConnected { return state }
+            if !targetConnected && state.isDisconnected { return state }
+            try await Task.sleep(for: .milliseconds(300))
+        }
+        let finalDict = try await getRawFields(["ppp_status"], forceMultiData: true)
+        return WANConnectionState(pppStatus: finalDict["ppp_status"] ?? "")
     }
 
     @discardableResult

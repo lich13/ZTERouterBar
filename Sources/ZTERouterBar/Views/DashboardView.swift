@@ -3,6 +3,7 @@ import ZTERouterCore
 
 enum DashboardTab: String, CaseIterable, Identifiable {
     case overview
+    case watchdog
     case settings
 
     var id: String { rawValue }
@@ -10,6 +11,7 @@ enum DashboardTab: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .overview: "信号与概览"
+        case .watchdog: "保活守护"
         case .settings: "配置与设置"
         }
     }
@@ -17,6 +19,7 @@ enum DashboardTab: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .overview: "waveform.path.ecg"
+        case .watchdog: "shield.checkered"
         case .settings: "gearshape"
         }
     }
@@ -40,6 +43,8 @@ struct DashboardView: View {
                     switch viewModel.selectedDashboardTab {
                     case .overview:
                         SignalOverviewTab(viewModel: viewModel)
+                    case .watchdog:
+                        WatchdogView(viewModel: viewModel)
                     case .settings:
                         SettingsView(viewModel: viewModel)
                     }

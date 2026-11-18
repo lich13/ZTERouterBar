@@ -20,12 +20,25 @@ final class RouterViewModel {
     var isUIActive: Bool = false
     var selectedDashboardTab: DashboardTab = .overview
 
+    // Watchdog state
+    var isWatchdogRunning: Bool = false
+    var watchdogPhase: WatchdogPhase = .idle
+    var lastProbeOutcomes: [EndpointProbeOutcome] = []
+    var lastWatchdogHealthy: Bool?
+    var watchdogLogs: [WatchdogLogEntry] = []
+    var isProbingOnce: Bool = false
+
     var lastError: String?
     var actionStatusMessage: String?
     var launchAtLoginEnabled: Bool = false
 
     private var pollingTask: Task<Void, Never>?
+    private var watchdogTask: Task<Void, Never>?
     private var clearMessageTask: Task<Void, Never>?
+    private var userStoppedWatchdog = false
+
+    private let prober: any EndpointProbing = URLEndpointProber()
+    private let watchdogRunner = WatchdogRunner()
 
     init(
         settings: SettingsStore = SettingsStore(),
@@ -46,6 +59,10 @@ final class RouterViewModel {
         reloadPasswordFromKeychain()
         rebuildClient()
         refreshLaunchAtLoginStatus()
+
+        if settings.watchdogConfig.autoStart && hasStoredPassword {
+            startWatchdog()
+        }
     }
 
     var activeProfile: RouterProfile {
@@ -64,7 +81,6 @@ final class RouterViewModel {
                     await self.refreshNow(silent: true)
                 }
                 let baseInterval = self.isUIActive ? min(2.0, self.settings.pollingInterval) : max(3.0, self.settings.pollingInterval * 2.0)
-                // Back off when another browser/device holds the single ZTE admin slot so we do not trip login lockout.
                 let interval = self.isSessionOccupied ? max(15.0, baseInterval * 4.0) : baseInterval
                 try? await Task.sleep(for: .seconds(interval))
             }
@@ -83,6 +99,161 @@ final class RouterViewModel {
             if hasStoredPassword && !isSessionOccupied {
                 Task { await refreshNow(silent: true) }
             }
+        }
+    }
+
+    // MARK: - Watchdog Controls
+
+    func startWatchdog() {
+        guard let client else {
+            appendWatchdogLog(WatchdogLogEntry(level: .error, message: "尚未配置有效的路由器地址，无法启动守护"))
+            return
+        }
+        guard hasStoredPassword || !passwordInput.isEmpty else {
+            appendWatchdogLog(WatchdogLogEntry(level: .warning, message: "尚未保存路由器管理密码，请在配置中设置后再启动守护"))
+            return
+        }
+        let validEndpoints = settings.watchdogConfig.enabledValidEndpoints
+        guard !validEndpoints.isEmpty else {
+            appendWatchdogLog(WatchdogLogEntry(level: .warning, message: "请至少启用一个有效的 HTTP/HTTPS 检测端点"))
+            return
+        }
+
+        userStoppedWatchdog = false
+        watchdogTask?.cancel()
+        isWatchdogRunning = true
+        let config = settings.watchdogConfig.clamped()
+
+        watchdogTask = Task { [weak self] in
+            guard let self else { return }
+            await self.watchdogRunner.run(
+                config: config,
+                prober: self.prober,
+                router: client,
+                canReconnect: { [weak self] in
+                    await MainActor.run {
+                        guard let self else { return "已退出" }
+                        if self.isReconnectingWAN {
+                            return "正在执行手动重连，跳过本次自动重连"
+                        }
+                        if self.settings.watchdogConfig.onlyWhenWiFiMatched {
+                            guard let ssid = self.wifiMonitor.currentSSID else {
+                                return "未检测到当前 Wi-Fi 名称（已开启仅匹配 Wi-Fi 时自动重连）"
+                            }
+                            guard self.activeProfile.matches(ssid: ssid) else {
+                                return "当前 Wi-Fi「\(ssid)」未绑定至当前配置「\(self.activeProfile.name)」"
+                            }
+                        }
+                        return nil
+                    }
+                },
+                onEvent: { [weak self] event in
+                    await MainActor.run {
+                        self?.handleWatchdogEvent(event)
+                    }
+                }
+            )
+            await MainActor.run {
+                self.isWatchdogRunning = false
+                self.watchdogPhase = .idle
+                self.watchdogTask = nil
+            }
+        }
+    }
+
+    func stopWatchdog(userInitiated: Bool = true) {
+        if userInitiated {
+            userStoppedWatchdog = true
+        }
+        watchdogTask?.cancel()
+        watchdogTask = nil
+        isWatchdogRunning = false
+        watchdogPhase = .idle
+    }
+
+    func toggleWatchdog() {
+        if isWatchdogRunning {
+            stopWatchdog(userInitiated: true)
+            showToast("外网保活守护已停止")
+        } else {
+            startWatchdog()
+            if isWatchdogRunning {
+                showToast("外网保活守护已启动")
+            }
+        }
+    }
+
+    func updateWatchdogConfig(_ newConfig: WatchdogConfig) {
+        settings.watchdogConfig = newConfig.clamped()
+        if isWatchdogRunning {
+            startWatchdog()
+            showToast("守护配置已更新并生效")
+        } else {
+            showToast("守护配置已保存")
+        }
+    }
+
+    func restoreDefaultWatchdogEndpoints() {
+        var copy = settings.watchdogConfig
+        copy.endpoints = WatchdogEndpoint.defaultPresets
+        updateWatchdogConfig(copy)
+    }
+
+    func runSingleWatchdogProbe() async {
+        guard !isProbingOnce else { return }
+        let endpoints = settings.watchdogConfig.enabledValidEndpoints
+        guard !endpoints.isEmpty else {
+            appendWatchdogLog(WatchdogLogEntry(level: .warning, message: "没有启用的有效探测端点"))
+            return
+        }
+        isProbingOnce = true
+        defer { isProbingOnce = false }
+
+        appendWatchdogLog(WatchdogLogEntry(level: .info, message: "手动执行单轮连通性探测（\(endpoints.count) 个端点）…"))
+        let results = await watchdogRunner.probeAll(
+            endpoints: endpoints,
+            timeoutMs: settings.watchdogConfig.checkTimeoutMs,
+            prober: prober
+        )
+        let healthy = WatchdogEvaluator.isHealthy(outcomes: results, policy: settings.watchdogConfig.triggerPolicy)
+        lastProbeOutcomes = results
+        lastWatchdogHealthy = healthy
+        for item in results {
+            appendWatchdogLog(WatchdogLogEntry(
+                level: item.reachable ? .info : .warning,
+                message: "  \(WatchdogEvaluator.formatProbeSummary(item))"
+            ))
+        }
+        appendWatchdogLog(WatchdogLogEntry(
+            level: healthy ? .success : .warning,
+            message: healthy ? "==> 单轮探测结果：网络正常" : "==> 单轮探测结果：未达到可达条件"
+        ))
+    }
+
+    func clearWatchdogLogs() {
+        watchdogLogs.removeAll()
+    }
+
+    private func handleWatchdogEvent(_ event: WatchdogEvent) {
+        switch event {
+        case let .phaseChanged(phase):
+            let previous = watchdogPhase
+            watchdogPhase = phase
+            if previous == .reconnecting && phase != .reconnecting {
+                Task { await refreshNow(silent: true) }
+            }
+        case let .probeRoundCompleted(outcomes, overallHealthy):
+            lastProbeOutcomes = outcomes
+            lastWatchdogHealthy = overallHealthy
+        case let .log(entry):
+            appendWatchdogLog(entry)
+        }
+    }
+
+    private func appendWatchdogLog(_ entry: WatchdogLogEntry) {
+        watchdogLogs.append(entry)
+        if watchdogLogs.count > 300 {
+            watchdogLogs.removeFirst(watchdogLogs.count - 300)
         }
     }
 
@@ -121,6 +292,13 @@ final class RouterViewModel {
         }
         if hasStoredPassword {
             Task { await refreshNow(silent: false) }
+            if isWatchdogRunning {
+                startWatchdog()
+            } else if settings.watchdogConfig.autoStart && !userStoppedWatchdog {
+                startWatchdog()
+            }
+        } else if isWatchdogRunning {
+            stopWatchdog(userInitiated: false)
         }
     }
 
@@ -165,9 +343,17 @@ final class RouterViewModel {
             if lastError == nil {
                 showToast("已保存并成功连接「\(profile.name)」")
             }
+            if hasStoredPassword && settings.watchdogConfig.autoStart && !userStoppedWatchdog && !isWatchdogRunning {
+                startWatchdog()
+            } else if isWatchdogRunning {
+                startWatchdog()
+            }
         } else if profile.id == settings.activeProfileID {
             reloadPasswordFromKeychain()
             rebuildClient()
+            if isWatchdogRunning {
+                startWatchdog()
+            }
         }
     }
 
@@ -191,6 +377,7 @@ final class RouterViewModel {
             hasStoredPassword = false
             snapshot = nil
             isSessionOccupied = false
+            stopWatchdog(userInitiated: false)
             rebuildClient()
         }
     }
@@ -268,7 +455,7 @@ final class RouterViewModel {
         }
     }
 
-    // MARK: - One-Click WAN Reconnect (Zero Confirmation Popup)
+    // MARK: - One-Click WAN Reconnect
 
     func reconnectWAN() async {
         guard !isReconnectingWAN else { return }

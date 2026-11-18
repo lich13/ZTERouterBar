@@ -62,6 +62,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
             _ = viewModel.snapshot
             _ = viewModel.isReconnectingWAN
             _ = viewModel.isSessionOccupied
+            _ = viewModel.isWatchdogRunning
+            _ = viewModel.watchdogPhase
             _ = viewModel.lastError
             _ = viewModel.hasStoredPassword
             _ = viewModel.settings.activeProfileID
@@ -94,7 +96,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         let symbolName: String
         let tintColor: NSColor
 
-        if viewModel.isReconnectingWAN {
+        let isAutoReconnecting = (viewModel.watchdogPhase == .reconnecting)
+        if viewModel.isReconnectingWAN || isAutoReconnecting {
             symbolName = "arrow.triangle.2.circlepath"
             tintColor = .systemOrange
         } else if viewModel.isSessionOccupied {
@@ -130,7 +133,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         button.imagePosition = .imageLeading
 
         let titleText: String
-        if viewModel.isReconnectingWAN {
+        if viewModel.isReconnectingWAN || viewModel.watchdogPhase == .reconnecting {
             titleText = " 重连中"
         } else if viewModel.isSessionOccupied {
             titleText = viewModel.settings.menuBarDisplayStyle == .iconOnly ? "" : " 占用"
@@ -163,12 +166,14 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
 
     private func buildTooltip() -> String {
         let profileName = viewModel.activeProfile.name
+        let watchdogStatus = viewModel.isWatchdogRunning ? "保活守护：\(viewModel.watchdogPhase.displayLabel)" : "保活守护：已关闭"
         guard let snap = viewModel.snapshot else {
-            return "ZTE 移动路由助手 (\(profileName))\n左键打开面板 · ⌥+左键一键重连外网"
+            return "ZTE 移动路由助手 (\(profileName))\n\(watchdogStatus)\n左键打开面板 · ⌥+左键一键重连外网"
         }
         return """
         [\(profileName)] \(snap.connectionState.localizedLabel) · \(snap.networkType) \(snap.bandSummary)
         ↓ \(Formatters.speedBits(snap.rxBytesPerSec))  ↑ \(Formatters.speedBits(snap.txBytesPerSec)) · 终端 \(snap.totalConnectedDevices) 台
+        \(watchdogStatus)
         左键打开面板 · ⌥+左键一键重连外网 · 右键菜单
         """
     }
@@ -235,6 +240,12 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         reconnectItem.isEnabled = viewModel.hasStoredPassword && !viewModel.isReconnectingWAN
         menu.addItem(reconnectItem)
 
+        let watchdogTitle = viewModel.isWatchdogRunning ? "停止外网保活守护" : "开启外网保活守护"
+        let watchdogItem = NSMenuItem(title: watchdogTitle, action: #selector(menuToggleWatchdog), keyEquivalent: "")
+        watchdogItem.target = self
+        watchdogItem.isEnabled = viewModel.hasStoredPassword
+        menu.addItem(watchdogItem)
+
         if viewModel.settings.profiles.count > 1 {
             let profileMenuItem = NSMenuItem(title: "切换路由器配置", action: nil, keyEquivalent: "")
             let profileSubmenu = NSMenu()
@@ -262,6 +273,10 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         dashItem.target = self
         menu.addItem(dashItem)
 
+        let watchdogSettingsItem = NSMenuItem(title: "保活守护设置与日志…", action: #selector(menuOpenWatchdog), keyEquivalent: "")
+        watchdogSettingsItem.target = self
+        menu.addItem(watchdogSettingsItem)
+
         let webItem = NSMenuItem(title: "在浏览器打开管理界面", action: #selector(menuOpenBrowser), keyEquivalent: "")
         webItem.target = self
         menu.addItem(webItem)
@@ -285,6 +300,10 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         Task { await viewModel.reconnectWAN() }
     }
 
+    @objc private func menuToggleWatchdog() {
+        viewModel.toggleWatchdog()
+    }
+
     @objc private func menuSelectProfile(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
               let id = UUID(uuidString: raw) else { return }
@@ -293,6 +312,10 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
 
     @objc private func menuOpenDashboard() {
         openDashboard(tab: .overview)
+    }
+
+    @objc private func menuOpenWatchdog() {
+        openDashboard(tab: .watchdog)
     }
 
     @objc private func menuOpenSettings() {

@@ -28,6 +28,7 @@ final class SettingsStore {
         static let pollingInterval = "zte.router.pollingInterval"
         static let menuBarDisplayStyle = "zte.router.menuBarDisplayStyle"
         static let globalShortcutEnabled = "zte.router.globalShortcutEnabled"
+        static let watchdogConfig = "zte.router.watchdogConfig.v1"
         // Legacy single-profile keys for migration
         static let legacyRouterURL = "zte.router.url"
         static let legacyHashPreference = "zte.router.hashPreference"
@@ -55,6 +56,10 @@ final class SettingsStore {
 
     var globalShortcutEnabled: Bool {
         didSet { defaults.set(globalShortcutEnabled, forKey: Keys.globalShortcutEnabled) }
+    }
+
+    var watchdogConfig: WatchdogConfig {
+        didSet { saveWatchdogConfig() }
     }
 
     var menuBarDisplayStyle: MenuBarDisplayStyle {
@@ -87,7 +92,6 @@ final class SettingsStore {
                 hashPreference: legacyHash
             )
             loadedProfiles = [defaultProfile]
-            // Migrate legacy Keychain entry if present
             if let oldPassword = KeychainPasswordStore.loadLegacyPassword(for: legacyURL), !oldPassword.isEmpty {
                 KeychainPasswordStore.savePassword(oldPassword, forProfileID: defaultProfile.id)
             }
@@ -108,7 +112,21 @@ final class SettingsStore {
         self.menuBarDisplayStyleRaw = defaults.string(forKey: Keys.menuBarDisplayStyle) ?? MenuBarDisplayStyle.iconAndBand.rawValue
         self.globalShortcutEnabled = defaults.object(forKey: Keys.globalShortcutEnabled) as? Bool ?? true
 
+        if let wdData = defaults.data(forKey: Keys.watchdogConfig),
+           var decodedWD = try? JSONDecoder().decode(WatchdogConfig.self, from: wdData) {
+            for idx in decodedWD.endpoints.indices {
+                let id = decodedWD.endpoints[idx].id
+                if let proxyPass = KeychainPasswordStore.loadProxyPassword(forEndpointID: id) {
+                    decodedWD.endpoints[idx].proxyPassword = proxyPass
+                }
+            }
+            self.watchdogConfig = decodedWD.clamped()
+        } else {
+            self.watchdogConfig = WatchdogConfig()
+        }
+
         saveProfiles()
+        saveWatchdogConfig()
         defaults.set(activeProfileID.uuidString, forKey: Keys.activeProfileID)
     }
 
@@ -151,10 +169,28 @@ final class SettingsStore {
             defaults.set(encoded, forKey: Keys.profiles)
         }
     }
+
+    private func saveWatchdogConfig() {
+        // Store optional proxy passwords in Keychain rather than UserDefaults plist.
+        var sanitized = watchdogConfig.clamped()
+        for idx in sanitized.endpoints.indices {
+            let ep = sanitized.endpoints[idx]
+            if ep.proxyPassword.isEmpty {
+                KeychainPasswordStore.deleteProxyPassword(forEndpointID: ep.id)
+            } else {
+                KeychainPasswordStore.saveProxyPassword(ep.proxyPassword, forEndpointID: ep.id)
+            }
+            sanitized.endpoints[idx].proxyPassword = ""
+        }
+        if let encoded = try? JSONEncoder().encode(sanitized) {
+            defaults.set(encoded, forKey: Keys.watchdogConfig)
+        }
+    }
 }
 
 enum KeychainPasswordStore {
     private static let profileService = "com.zte.routerbar.profile"
+    private static let proxyService = "com.zte.routerbar.watchdogProxy"
     private static let legacyService = "com.zte.routerbar.admin"
 
     static func loadPassword(forProfileID id: UUID) -> String? {
@@ -169,6 +205,20 @@ enum KeychainPasswordStore {
     @discardableResult
     static func deletePassword(forProfileID id: UUID) -> OSStatus {
         delete(service: profileService, account: id.uuidString)
+    }
+
+    static func loadProxyPassword(forEndpointID id: UUID) -> String? {
+        load(service: proxyService, account: id.uuidString)
+    }
+
+    @discardableResult
+    static func saveProxyPassword(_ password: String, forEndpointID id: UUID) -> OSStatus {
+        save(password, service: proxyService, account: id.uuidString)
+    }
+
+    @discardableResult
+    static func deleteProxyPassword(forEndpointID id: UUID) -> OSStatus {
+        delete(service: proxyService, account: id.uuidString)
     }
 
     static func loadLegacyPassword(for hostKey: String) -> String? {
