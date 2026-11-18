@@ -347,7 +347,14 @@ private struct SignalOverviewTab: View {
     }
 
     private func stationsCard(snap: RouterStatusSnapshot) -> some View {
-        GroupBox("已连接终端：共 \(snap.totalConnectedDevices) 台（无线 \(snap.wirelessDeviceCount) 台 / 有线 \(snap.wiredDeviceCount) 台）") {
+        let radioDetail: String = {
+            if let c24 = snap.wifi24GCount, let c5 = snap.wifi5GCount {
+                return "无线 \(snap.wirelessDeviceCount) 台（2.4G \(c24) / 5G \(c5)）· 有线 \(snap.wiredDeviceCount) 台"
+            }
+            return "无线 \(snap.wirelessDeviceCount) 台 · 有线 \(snap.wiredDeviceCount) 台"
+        }()
+
+        return GroupBox("已连接终端：共 \(snap.totalConnectedDevices) 台（\(radioDetail)）") {
             let all = snap.wifiStations + snap.lanStations
             if all.isEmpty {
                 Text(snap.wirelessDeviceCount > 0 ? "路由器报告无线接入 \(snap.wirelessDeviceCount) 台（明细列表暂为空）" : "暂无已连接终端")
@@ -358,7 +365,7 @@ private struct SignalOverviewTab: View {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(all) { st in
                         HStack {
-                            Image(systemName: st.interfaceType.uppercased().contains("WIFI") ? "wifi" : "cable.connector")
+                            Image(systemName: st.deviceKind == .wired ? "cable.connector" : "wifi")
                                 .foregroundStyle(.secondary)
                             Text(st.hostname.isEmpty ? "未知设备" : st.hostname)
                                 .font(.subheadline)
@@ -367,7 +374,7 @@ private struct SignalOverviewTab: View {
                                 .font(.caption.monospacedDigit())
                             Text("·")
                                 .foregroundStyle(.tertiary)
-                            Text(st.interfaceType)
+                            Text(st.displayConnectionType)
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                             Text("·")

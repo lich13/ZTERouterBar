@@ -37,13 +37,25 @@ struct PopoverView: View {
             }
 
             if let error = viewModel.lastError {
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                    Text(error)
-                        .font(.caption)
-                        .foregroundStyle(.primary)
-                        .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.primary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if viewModel.isSessionOccupied {
+                        HStack {
+                            Spacer()
+                            Button("尝试接管并重连") {
+                                Task { await viewModel.refreshNow(silent: false) }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
                 }
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -143,7 +155,7 @@ struct PopoverView: View {
                 }
             } label: {
                 HStack(spacing: 4) {
-                    Image(systemName: "router")
+                    Image(systemName: "wifi.router")
                         .font(.caption2)
                     Text(viewModel.activeProfile.name)
                         .font(.caption.weight(.medium))

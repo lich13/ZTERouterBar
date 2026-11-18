@@ -104,7 +104,7 @@ struct SettingsView: View {
                 let isEditing = editingProfileID == profile.id
                 let isActive = viewModel.settings.activeProfileID == profile.id
                 HStack(spacing: 10) {
-                    Image(systemName: isActive ? "checkmark.circle.fill" : "router")
+                    Image(systemName: isActive ? "checkmark.circle.fill" : "wifi.router")
                         .foregroundStyle(isActive ? .green : .secondary)
 
                     VStack(alignment: .leading, spacing: 2) {

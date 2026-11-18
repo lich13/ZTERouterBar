@@ -54,7 +54,7 @@ struct ZTERouterCoreTests {
         #expect(RouterProfileMatcher.match(ssid: nil, in: [p1, p2]) == nil)
     }
 
-    @Test("Status parser combines wifi_access_sta_num, station_list, and lan_station_list")
+    @Test("Status parser combines radio counts, station_list, lan_station_list and hides bogus WIFI5 label")
     func testStatusAndStationCountParser() throws {
         let mu5120JSON1 = """
         {
@@ -93,7 +93,9 @@ struct ZTERouterCoreTests {
           "realtime_time": "20613",
           "battery_value": "100",
           "battery_charging": "2",
-          "wifi_access_sta_num": "6"
+          "wifi_access_sta_num": "6",
+          "wifi_chip1_ssid1_access_sta_num": "1",
+          "wifi_chip2_ssid1_access_sta_num": "5"
         }
         """
 
@@ -101,7 +103,7 @@ struct ZTERouterCoreTests {
         {
           "station_list": [
             {"interfacetype": "WIFI5", "ip_addr": "192.168.8.47", "connect_time": "120", "ssid_index": "2", "mac_addr": "00:00:5E:00:53:01", "hostname": "device-1"},
-            {"interfacetype": "WIFI5", "ip_addr": "192.168.8.48", "connect_time": "60", "ssid_index": "2", "mac_addr": "00:00:5E:00:53:02", "hostname": "device-2"}
+            {"interfacetype": "WIFI5", "ip_addr": "192.168.8.48", "connect_time": "60", "ssid_index": "1", "mac_addr": "00:00:5E:00:53:02", "hostname": "device-2"}
           ]
         }
         """
@@ -109,7 +111,7 @@ struct ZTERouterCoreTests {
         let lanStationListJSON = """
         {
           "lan_station_list": [
-            {"interfacetype": "LAN", "ip_addr": "192.168.8.50", "connect_time": "300", "ssid_index": "", "mac_addr": "00:00:5E:00:53:03", "hostname": "wired-1"}
+            {"interfacetype": "", "ip_addr": "192.168.8.50", "connect_time": "300", "ssid_index": "", "mac_addr": "00:00:5E:00:53:03", "hostname": "wired-1"}
           ]
         }
         """
@@ -128,11 +130,17 @@ struct ZTERouterCoreTests {
         #expect(snap.nrCells[0].pci == "297")
         #expect(snap.nrCells[0].band == "n41")
         #expect(snap.wifiAccessStationCount == 6)
+        #expect(snap.wifi24GCount == 1)
+        #expect(snap.wifi5GCount == 5)
         #expect(snap.wirelessDeviceCount == 6)
         #expect(snap.wiredDeviceCount == 1)
         #expect(snap.totalConnectedDevices == 7)
         #expect(snap.wifiStations.count == 2)
+        #expect(snap.wifiStations[0].deviceKind == .wireless)
+        #expect(snap.wifiStations[0].displayConnectionType == "无线 Wi-Fi")
         #expect(snap.lanStations.count == 1)
+        #expect(snap.lanStations[0].deviceKind == .wired)
+        #expect(snap.lanStations[0].displayConnectionType == "有线 / USB")
     }
 
     @Test("Status parser parses LTE CA + NSA cells and filters invalid sensors")
@@ -174,11 +182,20 @@ struct ZTERouterCoreTests {
         #expect(snap.temperatures.isEmpty)
     }
 
-    @Test("Client queries station_list individually without multi_data and reconnects WAN in one flow")
-    func testClientFetchAndReconnectFlow() async throws {
-        let transport = MockTransport()
+    @Test("Client sends multi_data=1 on loginfo, queries station_list individually, and recovers from kicked session on reconnect")
+    func testClientKickedSessionRecoveryAndReconnect() async throws {
+        let transport = MockTransport(simulateKickedOutBeforeDisconnect: true, simulateDuplicateUntilLogout: true)
         let config = try RouterEndpointConfig(baseURLString: "http://192.168.8.1", hashPreference: .auto)
         let client = ZTERouterClient(config: config, password: "fixture-password", transport: transport)
+
+        // Background fetch with reclaimIfDuplicate=false hits duplicateUser cleanly
+        await #expect(throws: ZTERouterError.duplicateUser) {
+            _ = try await client.fetchStatus(reclaimIfDuplicate: false)
+        }
+
+        // User-initiated reconnect reclaims via LOGOUT -> LOGIN and recovers even if kicked mid-flight
+        let finalState = try await client.reconnectInternet(pauseBetweenDisconnectAndConnect: .milliseconds(10))
+        #expect(finalState.isConnected)
 
         let snap = try await client.fetchStatus()
         #expect(snap.wirelessDeviceCount == 6)
@@ -186,13 +203,18 @@ struct ZTERouterCoreTests {
         #expect(snap.wiredDeviceCount == 1)
         #expect(snap.totalConnectedDevices == 7)
 
-        let finalState = try await client.reconnectInternet(pauseBetweenDisconnectAndConnect: .milliseconds(10))
-        #expect(finalState.isConnected)
-
         let captured = await transport.capturedRequests
         for req in captured {
             #expect(req.value(forHTTPHeaderField: "Referer") == "http://192.168.8.1/index.html")
             #expect(req.value(forHTTPHeaderField: "Origin") == "http://192.168.8.1")
+        }
+
+        let loginfoQueries = captured.filter {
+            $0.httpMethod == "GET" && ($0.url?.absoluteString.contains("cmd=loginfo") ?? false)
+        }
+        #expect(!loginfoQueries.isEmpty)
+        for q in loginfoQueries {
+            #expect(q.url?.absoluteString.contains("multi_data=1") == true)
         }
 
         let stationQueries = captured.filter {
@@ -205,11 +227,9 @@ struct ZTERouterCoreTests {
             guard req.httpMethod == "POST", let body = req.httpBody, let text = String(data: body, encoding: .utf8) else { return nil }
             return text.split(separator: "&").first(where: { $0.hasPrefix("goformId=") }).map(String.init)
         }
-        #expect(postGoforms == [
-            "goformId=LOGIN",
-            "goformId=DISCONNECT_NETWORK",
-            "goformId=CONNECT_NETWORK"
-        ])
+        #expect(postGoforms.contains("goformId=LOGOUT"))
+        #expect(postGoforms.contains("goformId=DISCONNECT_NETWORK"))
+        #expect(postGoforms.contains("goformId=CONNECT_NETWORK"))
     }
 
     @Test("Client surfaces wrongPassword error on code 3")
@@ -229,9 +249,17 @@ private actor MockTransport: HTTPTransport {
     private var loggedIn = false
     private var wanConnected = true
     private let rejectLogin: Bool
+    private var simulateKickedOutBeforeDisconnect: Bool
+    private var occupiedByOtherSession: Bool
 
-    init(rejectLogin: Bool = false) {
+    init(
+        rejectLogin: Bool = false,
+        simulateKickedOutBeforeDisconnect: Bool = false,
+        simulateDuplicateUntilLogout: Bool = false
+    ) {
         self.rejectLogin = rejectLogin
+        self.simulateKickedOutBeforeDisconnect = simulateKickedOutBeforeDisconnect
+        self.occupiedByOtherSession = simulateDuplicateUntilLogout
     }
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
@@ -251,11 +279,11 @@ private actor MockTransport: HTTPTransport {
             } else if cmd == "station_list" {
                 payload["station_list"] = [
                     ["interfacetype": "WIFI5", "ip_addr": "192.168.8.47", "connect_time": "100", "ssid_index": "2", "mac_addr": "00:00:5E:00:53:01", "hostname": "dev-1"],
-                    ["interfacetype": "WIFI5", "ip_addr": "192.168.8.48", "connect_time": "200", "ssid_index": "2", "mac_addr": "00:00:5E:00:53:02", "hostname": "dev-2"]
+                    ["interfacetype": "WIFI5", "ip_addr": "192.168.8.48", "connect_time": "200", "ssid_index": "1", "mac_addr": "00:00:5E:00:53:02", "hostname": "dev-2"]
                 ]
             } else if cmd == "lan_station_list" {
                 payload["lan_station_list"] = [
-                    ["interfacetype": "LAN", "ip_addr": "192.168.8.50", "connect_time": "300", "ssid_index": "", "mac_addr": "00:00:5E:00:53:03", "hostname": "lan-1"]
+                    ["interfacetype": "", "ip_addr": "192.168.8.50", "connect_time": "300", "ssid_index": "", "mac_addr": "00:00:5E:00:53:03", "hostname": "lan-1"]
                 ]
             } else {
                 for key in cmd.split(separator: ",").map(String.init) {
@@ -264,7 +292,11 @@ private actor MockTransport: HTTPTransport {
                     case "cr_version": payload[key] = ""
                     case "RD": payload[key] = "MOCK_RD_123"
                     case "LD": payload[key] = "MOCK_LD_456"
+                    case "modem_main_state": payload[key] = "modem_init_complete"
+                    case "network_type": payload[key] = "SA"
                     case "wifi_access_sta_num": payload[key] = "6"
+                    case "wifi_chip1_ssid1_access_sta_num": payload[key] = "1"
+                    case "wifi_chip2_ssid1_access_sta_num": payload[key] = "5"
                     case "ppp_status": payload[key] = wanConnected ? "ipv4_ipv6_connected" : "ppp_disconnected"
                     default: payload[key] = ""
                     }
@@ -283,13 +315,25 @@ private actor MockTransport: HTTPTransport {
         case "LOGIN":
             if rejectLogin {
                 result = "3"
+            } else if occupiedByOtherSession {
+                result = "2"
             } else {
                 loggedIn = true
                 result = "0"
             }
-        case "DISCONNECT_NETWORK":
-            wanConnected = false
+        case "LOGOUT":
+            occupiedByOtherSession = false
+            loggedIn = false
             result = "success"
+        case "DISCONNECT_NETWORK":
+            if simulateKickedOutBeforeDisconnect {
+                simulateKickedOutBeforeDisconnect = false
+                loggedIn = false
+                result = "failure"
+            } else {
+                wanConnected = false
+                result = "success"
+            }
         case "CONNECT_NETWORK":
             wanConnected = true
             result = "success"

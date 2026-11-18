@@ -61,6 +61,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         withObservationTracking {
             _ = viewModel.snapshot
             _ = viewModel.isReconnectingWAN
+            _ = viewModel.isSessionOccupied
             _ = viewModel.lastError
             _ = viewModel.hasStoredPassword
             _ = viewModel.settings.activeProfileID
@@ -96,6 +97,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         if viewModel.isReconnectingWAN {
             symbolName = "arrow.triangle.2.circlepath"
             tintColor = .systemOrange
+        } else if viewModel.isSessionOccupied {
+            symbolName = "exclamationmark.triangle"
+            tintColor = .systemOrange
         } else if !viewModel.hasStoredPassword {
             symbolName = "antenna.radiowaves.left.and.right.slash"
             tintColor = .secondaryLabelColor
@@ -128,6 +132,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         let titleText: String
         if viewModel.isReconnectingWAN {
             titleText = " 重连中"
+        } else if viewModel.isSessionOccupied {
+            titleText = viewModel.settings.menuBarDisplayStyle == .iconOnly ? "" : " 占用"
         } else if let snap = viewModel.snapshot {
             switch viewModel.settings.menuBarDisplayStyle {
             case .iconOnly:

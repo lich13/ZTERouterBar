@@ -25,6 +25,9 @@ if [[ "${BUILD_CONFIG}" == "release" ]]; then
 fi
 
 cp "${ROOT_DIR}/Packaging/Info.plist" "${APP_BUNDLE}/Contents/Info.plist"
+if [[ -f "${ROOT_DIR}/Packaging/AppIcon.icns" ]]; then
+  cp "${ROOT_DIR}/Packaging/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
+fi
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${APP_VERSION}" "${APP_BUNDLE}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER}" "${APP_BUNDLE}/Contents/Info.plist"
 printf "APPL????" > "${APP_BUNDLE}/Contents/PkgInfo"

@@ -32,7 +32,9 @@ public enum RouterStatusParser {
         "realtime_tx_thrpt", "realtime_rx_thrpt", "realtime_time",
         "realtime_tx_bytes", "realtime_rx_bytes", "monthly_tx_bytes", "monthly_rx_bytes",
         "battery_value", "battery_charging", "signalbar",
-        "wifi_access_sta_num", "wifi_chip1_ssid1_access_sta_num", "wifi_chip2_ssid1_access_sta_num"
+        "wifi_access_sta_num",
+        "wifi_chip1_ssid1_access_sta_num", "wifi_chip1_ssid2_access_sta_num",
+        "wifi_chip2_ssid1_access_sta_num", "wifi_chip2_ssid2_access_sta_num"
     ]
 
     public static func parse(
@@ -48,9 +50,9 @@ public enum RouterStatusParser {
                 continue
             }
             for (key, value) in object {
-                if key == "station_list", let stations = decodeStations(from: value) {
+                if key == "station_list", let stations = decodeStations(from: value, kind: .wireless) {
                     wifiStations = stations
-                } else if key == "lan_station_list", let stations = decodeStations(from: value) {
+                } else if key == "lan_station_list", let stations = decodeStations(from: value, kind: .wired) {
                     lanStations = stations
                 }
                 rawStrings[key] = stringify(value)
@@ -114,11 +116,17 @@ public enum RouterStatusParser {
         let mcc = !field("mdm_mcc").isEmpty ? field("mdm_mcc") : field("rmcc")
         let mnc = !field("mdm_mnc").isEmpty ? field("mdm_mnc") : field("rmnc")
 
+        let c1s1 = Int(field("wifi_chip1_ssid1_access_sta_num"))
+        let c1s2 = Int(field("wifi_chip1_ssid2_access_sta_num"))
+        let c2s1 = Int(field("wifi_chip2_ssid1_access_sta_num"))
+        let c2s2 = Int(field("wifi_chip2_ssid2_access_sta_num"))
+
+        let wifi24GCount: Int? = (c1s1 != nil || c1s2 != nil) ? (c1s1 ?? 0) + (c1s2 ?? 0) : nil
+        let wifi5GCount: Int? = (c2s1 != nil || c2s2 != nil) ? (c2s1 ?? 0) + (c2s2 ?? 0) : nil
+
         let staCountFromChips: Int? = {
-            let c1 = Int(field("wifi_chip1_ssid1_access_sta_num"))
-            let c2 = Int(field("wifi_chip2_ssid1_access_sta_num"))
-            if c1 != nil || c2 != nil {
-                return (c1 ?? 0) + (c2 ?? 0)
+            if wifi24GCount != nil || wifi5GCount != nil {
+                return (wifi24GCount ?? 0) + (wifi5GCount ?? 0)
             }
             return nil
         }()
@@ -169,6 +177,8 @@ public enum RouterStatusParser {
             batteryCharging: field("battery_charging"),
             signalBars: Int(field("signalbar")),
             wifiAccessStationCount: wifiAccessStationCount,
+            wifi24GCount: wifi24GCount,
+            wifi5GCount: wifi5GCount,
             wifiStations: wifiStations,
             lanStations: lanStations,
             versionInfo: RouterVersionInfo(
@@ -182,10 +192,14 @@ public enum RouterStatusParser {
 
     // MARK: - Private Helpers
 
-    private static func decodeStations(from value: Any) -> [ConnectedStation]? {
+    private static func decodeStations(from value: Any, kind: ConnectedDeviceKind) -> [ConnectedStation]? {
         guard let array = value as? [[String: Any]] else { return nil }
         guard let data = try? JSONSerialization.data(withJSONObject: array) else { return nil }
-        return try? JSONDecoder().decode([ConnectedStation].self, from: data)
+        guard var decoded = try? JSONDecoder().decode([ConnectedStation].self, from: data) else { return nil }
+        for index in decoded.indices {
+            decoded[index].deviceKind = kind
+        }
+        return decoded
     }
 
     private static func stringify(_ value: Any) -> String {

@@ -16,6 +16,7 @@ final class RouterViewModel {
 
     var isRefreshing: Bool = false
     var isReconnectingWAN: Bool = false
+    var isSessionOccupied: Bool = false
     var isUIActive: Bool = false
     var selectedDashboardTab: DashboardTab = .overview
 
@@ -37,7 +38,6 @@ final class RouterViewModel {
             self?.handleWiFiSSIDChanged(ssid)
         }
 
-        // Initial auto-match if Wi-Fi SSID is already readable
         if settings.autoMatchByWiFi,
            let matched = RouterProfileMatcher.match(ssid: wifiMonitor.currentSSID, in: settings.profiles) {
             settings.activeProfileID = matched.id
@@ -63,7 +63,9 @@ final class RouterViewModel {
                 if self.hasStoredPassword {
                     await self.refreshNow(silent: true)
                 }
-                let interval = self.isUIActive ? min(2.0, self.settings.pollingInterval) : max(3.0, self.settings.pollingInterval * 2.0)
+                let baseInterval = self.isUIActive ? min(2.0, self.settings.pollingInterval) : max(3.0, self.settings.pollingInterval * 2.0)
+                // Back off when another browser/device holds the single ZTE admin slot so we do not trip login lockout.
+                let interval = self.isSessionOccupied ? max(15.0, baseInterval * 4.0) : baseInterval
                 try? await Task.sleep(for: .seconds(interval))
             }
         }
@@ -78,7 +80,7 @@ final class RouterViewModel {
         isUIActive = active
         if active {
             wifiMonitor.refreshSSID()
-            if hasStoredPassword {
+            if hasStoredPassword && !isSessionOccupied {
                 Task { await refreshNow(silent: true) }
             }
         }
@@ -111,6 +113,7 @@ final class RouterViewModel {
         settings.activeProfileID = profileID
         snapshot = nil
         lastError = nil
+        isSessionOccupied = false
         reloadPasswordFromKeychain()
         rebuildClient()
         if let announce {
@@ -155,6 +158,7 @@ final class RouterViewModel {
         if activateAndTest {
             settings.activeProfileID = profile.id
             snapshot = nil
+            isSessionOccupied = false
             reloadPasswordFromKeychain()
             rebuildClient()
             await refreshNow(silent: false)
@@ -186,6 +190,7 @@ final class RouterViewModel {
             passwordInput = ""
             hasStoredPassword = false
             snapshot = nil
+            isSessionOccupied = false
             rebuildClient()
         }
     }
@@ -239,9 +244,23 @@ final class RouterViewModel {
         defer { isRefreshing = false }
 
         do {
-            let fresh = try await client.fetchStatus()
+            let fresh = try await client.fetchStatus(reclaimIfDuplicate: !silent)
             self.snapshot = fresh
             self.lastError = nil
+            self.isSessionOccupied = false
+        } catch let routerError as ZTERouterError {
+            switch routerError {
+            case .duplicateUser:
+                self.isSessionOccupied = true
+                self.lastError = routerError.localizedDescription
+            case .wrongPassword, .loginRateLimited, .sessionExpired:
+                self.isSessionOccupied = false
+                self.lastError = routerError.localizedDescription
+            default:
+                if !silent || self.snapshot == nil {
+                    self.lastError = routerError.localizedDescription
+                }
+            }
         } catch {
             if !silent || self.snapshot == nil {
                 self.lastError = error.localizedDescription
@@ -264,8 +283,14 @@ final class RouterViewModel {
 
         do {
             let newState = try await client.reconnectInternet()
+            isSessionOccupied = false
             await refreshNow(silent: true)
             showToast(newState.isConnected ? "外网重连成功" : "已触发重连，状态：\(newState.localizedLabel)")
+        } catch let routerError as ZTERouterError {
+            if routerError == .duplicateUser {
+                isSessionOccupied = true
+            }
+            lastError = routerError.localizedDescription
         } catch {
             lastError = error.localizedDescription
         }

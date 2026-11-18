@@ -6,8 +6,9 @@ public enum ZTERouterError: LocalizedError, Sendable, Equatable {
     case wrongPassword
     case loginRateLimited
     case duplicateUser
-    case loginFailed(code: String)
+    case sessionExpired
     case commandFailed(goformId: String, result: String)
+    case loginFailed(code: String)
     case invalidResponse(String)
     case httpError(Int)
     case transportError(String)
@@ -23,7 +24,9 @@ public enum ZTERouterError: LocalizedError, Sendable, Equatable {
         case .loginRateLimited:
             "路由器登录尝试过于频繁，请稍后再试。"
         case .duplicateUser:
-            "路由器管理会话已被其他页面占用（duplicateUser），请稍后重试。"
+            "路由器后台仅允许单端登录，当前已被其他网页或设备占用；退出另一端登录或等待超时后将自动恢复。"
+        case .sessionExpired:
+            "路由器登录会话已失效（可能被其他终端踢出），请稍后重试。"
         case let .loginFailed(code):
             "登录失败（返回码：\(code)）。"
         case let .commandFailed(goformId, result):
@@ -95,17 +98,55 @@ public actor ZTERouterClient {
 
     // MARK: - Auth & Session
 
+    /// Queries `loginfo` WITH `multi_data=1` (required by ZTE firmware so another active browser session
+    /// does not cause a false `"ok"`).
     public func checkLoggedIn() async throws -> Bool {
-        let dict = try await getRawFields(["loginfo"])
+        let dict = try await getRawFields(["loginfo"], forceMultiData: true)
         let state = (dict["loginfo"] ?? "").lowercased()
         return state == "ok"
     }
 
-    public func login() async throws {
+    public func login(reclaimIfDuplicate: Bool = false) async throws {
         guard !password.isEmpty else {
             throw ZTERouterError.missingPassword
         }
 
+        let result = try await performLoginPOST()
+        switch result {
+        case "0", "4", "success":
+            self.lastKeepAliveAt = Date()
+            return
+        case "2":
+            guard reclaimIfDuplicate else {
+                throw ZTERouterError.duplicateUser
+            }
+            // Attempt to clear a stale/same-IP session via LOGOUT and re-login once.
+            _ = try? await attemptLogout()
+            try? await Task.sleep(for: .milliseconds(250))
+            let retryResult = try await performLoginPOST()
+            switch retryResult {
+            case "0", "4", "success":
+                self.lastKeepAliveAt = Date()
+                return
+            case "1":
+                throw ZTERouterError.loginRateLimited
+            case "2":
+                throw ZTERouterError.duplicateUser
+            case "3":
+                throw ZTERouterError.wrongPassword
+            default:
+                throw ZTERouterError.loginFailed(code: retryResult)
+            }
+        case "1":
+            throw ZTERouterError.loginRateLimited
+        case "3":
+            throw ZTERouterError.wrongPassword
+        default:
+            throw ZTERouterError.loginFailed(code: result)
+        }
+    }
+
+    private func performLoginPOST() async throws -> String {
         let meta = try await getRawFields(["wa_inner_version", "cr_version", "RD", "LD"])
         let wa = meta["wa_inner_version"] ?? ""
         let cr = meta["cr_version"] ?? ""
@@ -139,27 +180,23 @@ public actor ZTERouterClient {
             params.append(("AD", ad))
         }
 
-        let result = try await postGoformRaw(params)
-        switch result {
-        case "0", "4", "success":
-            self.lastKeepAliveAt = Date()
-            return
-        case "1":
-            throw ZTERouterError.loginRateLimited
-        case "2":
-            throw ZTERouterError.duplicateUser
-        case "3":
-            throw ZTERouterError.wrongPassword
-        default:
-            throw ZTERouterError.loginFailed(code: result)
-        }
+        return try await postGoformRaw(params)
     }
 
-    public func ensureAuthenticated() async throws {
+    private func attemptLogout() async throws -> String {
+        let ad = try await fetchFreshADToken()
+        return try await postGoformRaw([
+            ("isTest", "false"),
+            ("goformId", "LOGOUT"),
+            ("AD", ad)
+        ])
+    }
+
+    public func ensureAuthenticated(reclaimIfDuplicate: Bool = false) async throws {
         if try await checkLoggedIn() {
             return
         }
-        try await login()
+        try await login(reclaimIfDuplicate: reclaimIfDuplicate)
     }
 
     public func keepAliveIfNeeded(interval: TimeInterval = 55) async {
@@ -179,10 +216,30 @@ public actor ZTERouterClient {
 
     // MARK: - Status & Station List
 
-    public func fetchStatus() async throws -> RouterStatusSnapshot {
-        try await ensureAuthenticated()
+    public func fetchStatus(reclaimIfDuplicate: Bool = false) async throws -> RouterStatusSnapshot {
+        try await ensureAuthenticated(reclaimIfDuplicate: reclaimIfDuplicate)
         await keepAliveIfNeeded()
 
+        var snapshot = try await fetchSnapshotOnce()
+
+        // If the session was kicked out between `checkLoggedIn()` and `fetchSnapshotOnce()`,
+        // ZTE returns HTTP 200 with empty protected fields. Re-authenticate once and retry.
+        if snapshot.isUnauthenticatedEmptySnapshot {
+            try await login(reclaimIfDuplicate: reclaimIfDuplicate)
+            snapshot = try await fetchSnapshotOnce()
+            if snapshot.isUnauthenticatedEmptySnapshot {
+                throw ZTERouterError.sessionExpired
+            }
+        }
+
+        if !snapshot.versionInfo.waInnerVersion.isEmpty {
+            cachedWaInnerVersion = snapshot.versionInfo.waInnerVersion
+            cachedCrVersion = snapshot.versionInfo.crVersion
+        }
+        return snapshot
+    }
+
+    private func fetchSnapshotOnce() async throws -> RouterStatusSnapshot {
         let data1 = try await getRawData(RouterStatusParser.primarySignalCmds)
         let data2 = try await getRawData(RouterStatusParser.secondaryDashboardCmds)
         // ZTE firmware returns array JSON for `station_list` and `lan_station_list` only when queried individually without `multi_data=1`.
@@ -193,12 +250,7 @@ public actor ZTERouterClient {
         if let wifiStationsData { payloads.append(wifiStationsData) }
         if let lanStationsData { payloads.append(lanStationsData) }
 
-        let snapshot = try RouterStatusParser.parse(jsonDataList: payloads)
-        if !snapshot.versionInfo.waInnerVersion.isEmpty {
-            cachedWaInnerVersion = snapshot.versionInfo.waInnerVersion
-            cachedCrVersion = snapshot.versionInfo.crVersion
-        }
-        return snapshot
+        return try RouterStatusParser.parse(jsonDataList: payloads)
     }
 
     // MARK: - One-Click WAN Reconnect
@@ -207,8 +259,8 @@ public actor ZTERouterClient {
     public func reconnectInternet(
         pauseBetweenDisconnectAndConnect: Duration = .milliseconds(300)
     ) async throws -> WANConnectionState {
-        try await ensureAuthenticated()
-        let currentDict = try await getRawFields(["ppp_status"])
+        try await ensureAuthenticated(reclaimIfDuplicate: true)
+        let currentDict = try await getRawFields(["ppp_status"], forceMultiData: true)
         let currentState = WANConnectionState(pppStatus: currentDict["ppp_status"] ?? "")
 
         if !currentState.isDisconnected {
@@ -220,15 +272,25 @@ public actor ZTERouterClient {
 
     @discardableResult
     public func setInternetConnected(_ connect: Bool, waitUntilSettled: Bool = true) async throws -> WANConnectionState {
-        try await ensureAuthenticated()
+        try await ensureAuthenticated(reclaimIfDuplicate: true)
         let goformId = connect ? "CONNECT_NETWORK" : "DISCONNECT_NETWORK"
-        try await sendAuthenticatedSetCommand(
-            goformId: goformId,
-            extraParams: [("notCallback", "true")]
-        )
+
+        do {
+            try await sendAuthenticatedSetCommand(
+                goformId: goformId,
+                extraParams: [("notCallback", "true")]
+            )
+        } catch ZTERouterError.commandFailed {
+            // Session may have been kicked out right before POST; force re-login and retry once.
+            try await login(reclaimIfDuplicate: true)
+            try await sendAuthenticatedSetCommand(
+                goformId: goformId,
+                extraParams: [("notCallback", "true")]
+            )
+        }
 
         guard waitUntilSettled else {
-            let stateDict = try await getRawFields(["ppp_status"])
+            let stateDict = try await getRawFields(["ppp_status"], forceMultiData: true)
             return WANConnectionState(pppStatus: stateDict["ppp_status"] ?? "")
         }
 
@@ -236,7 +298,7 @@ public actor ZTERouterClient {
         while Date() < deadline {
             try Task.checkCancellation()
             try await Task.sleep(for: .milliseconds(300))
-            let stateDict = try await getRawFields(["ppp_status"])
+            let stateDict = try await getRawFields(["ppp_status"], forceMultiData: true)
             let state = WANConnectionState(pppStatus: stateDict["ppp_status"] ?? "")
             if connect && state.isConnected {
                 return state
@@ -245,7 +307,7 @@ public actor ZTERouterClient {
                 return state
             }
         }
-        let finalDict = try await getRawFields(["ppp_status"])
+        let finalDict = try await getRawFields(["ppp_status"], forceMultiData: true)
         return WANConnectionState(pppStatus: finalDict["ppp_status"] ?? "")
     }
 
@@ -290,8 +352,8 @@ public actor ZTERouterClient {
         )
     }
 
-    private func getRawFields(_ cmds: [String]) async throws -> [String: String] {
-        let data = try await getRawData(cmds)
+    private func getRawFields(_ cmds: [String], forceMultiData: Bool = false) async throws -> [String: String] {
+        let data = try await getRawData(cmds, forceMultiData: forceMultiData)
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ZTERouterError.invalidResponse("非 JSON 对象")
         }
@@ -306,14 +368,14 @@ public actor ZTERouterClient {
         return result
     }
 
-    private func getRawData(_ cmds: [String]) async throws -> Data {
+    private func getRawData(_ cmds: [String], forceMultiData: Bool = false) async throws -> Data {
         let endpoint = config.baseURL.appendingPathComponent("goform/goform_get_cmd_process")
         var comps = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
         var items: [URLQueryItem] = [
             URLQueryItem(name: "isTest", value: "false"),
             URLQueryItem(name: "cmd", value: cmds.joined(separator: ","))
         ]
-        if cmds.count > 1 {
+        if forceMultiData || cmds.count > 1 {
             items.append(URLQueryItem(name: "multi_data", value: "1"))
         }
         items.append(URLQueryItem(name: "_", value: String(Int(Date().timeIntervalSince1970 * 1000))))

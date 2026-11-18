@@ -7,6 +7,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        if let appIcon = Bundle.main.image(forResource: "AppIcon") {
+            NSApp.applicationIconImage = appIcon
+        }
         setupMainMenu()
         statusBarController = StatusBarController(viewModel: viewModel)
     }

@@ -99,14 +99,20 @@ public struct TemperatureReading: Equatable, Sendable, Identifiable {
     public let celsius: Double
 }
 
+public enum ConnectedDeviceKind: String, Codable, Equatable, Sendable {
+    case wireless
+    case wired
+}
+
 public struct ConnectedStation: Equatable, Sendable, Identifiable, Codable {
-    public var id: String { "\(ipAddress)-\(macAddress)-\(interfaceType)" }
+    public var id: String { "\(deviceKind.rawValue)-\(ipAddress)-\(macAddress)-\(ssidIndex)" }
     public let hostname: String
     public let ipAddress: String
     public let macAddress: String
     public let interfaceType: String
     public let connectTimeSeconds: Int
     public let ssidIndex: String
+    public var deviceKind: ConnectedDeviceKind
 
     enum CodingKeys: String, CodingKey {
         case hostname
@@ -132,6 +138,12 @@ public struct ConnectedStation: Equatable, Sendable, Identifiable, Codable {
         } else {
             connectTimeSeconds = 0
         }
+        let upperIf = interfaceType.uppercased()
+        if upperIf.contains("LAN") || upperIf.contains("USB") || upperIf.contains("ETH") || upperIf.contains("CABLE") {
+            deviceKind = .wired
+        } else {
+            deviceKind = .wireless
+        }
     }
 
     public init(
@@ -140,7 +152,8 @@ public struct ConnectedStation: Equatable, Sendable, Identifiable, Codable {
         macAddress: String,
         interfaceType: String,
         connectTimeSeconds: Int,
-        ssidIndex: String
+        ssidIndex: String,
+        deviceKind: ConnectedDeviceKind = .wireless
     ) {
         self.hostname = hostname
         self.ipAddress = ipAddress
@@ -148,6 +161,18 @@ public struct ConnectedStation: Equatable, Sendable, Identifiable, Codable {
         self.interfaceType = interfaceType
         self.connectTimeSeconds = connectTimeSeconds
         self.ssidIndex = ssidIndex
+        self.deviceKind = deviceKind
+    }
+
+    /// ZTE firmware hardcodes misleading `interfacetype` strings (e.g., `"WIFI5"` for all wireless devices)
+    /// and its own WebUI ignores `interfacetype`, separating wireless vs wired via `station_list` vs `lan_station_list`.
+    public var displayConnectionType: String {
+        switch deviceKind {
+        case .wired:
+            return "有线 / USB"
+        case .wireless:
+            return "无线 Wi-Fi"
+        }
     }
 }
 
@@ -210,6 +235,8 @@ public struct RouterStatusSnapshot: Equatable, Sendable {
     public let signalBars: Int?
 
     public let wifiAccessStationCount: Int?
+    public let wifi24GCount: Int?
+    public let wifi5GCount: Int?
     public let wifiStations: [ConnectedStation]
     public let lanStations: [ConnectedStation]
     public let versionInfo: RouterVersionInfo
@@ -224,6 +251,14 @@ public struct RouterStatusSnapshot: Equatable, Sendable {
 
     public var totalConnectedDevices: Int {
         wirelessDeviceCount + wiredDeviceCount
+    }
+
+    /// True when the router responded HTTP 200 with empty protected fields because session auth was evicted.
+    public var isUnauthenticatedEmptySnapshot: Bool {
+        if case let .unknown(raw) = connectionState, raw.isEmpty {
+            return modemMainState.isEmpty && wanConnectStatus.isEmpty && networkType.isEmpty && wanIPv4.isEmpty
+        }
+        return false
     }
 
     public var displayProvider: String {
