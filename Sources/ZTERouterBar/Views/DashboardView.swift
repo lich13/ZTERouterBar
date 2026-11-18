@@ -192,8 +192,16 @@ private struct SignalOverviewTab: View {
     }
 
     private func trafficAndSummaryRow(_ snap: RouterStatusSnapshot) -> some View {
-        HStack(spacing: 12) {
-            infoBox(title: "实时速率", primary: "↓ \(Formatters.speedBits(snap.rxBytesPerSec))", secondary: "↑ \(Formatters.speedBits(snap.txBytesPerSec))")
+        let assessment = SignalEvaluator.assess(snapshot: snap)
+        let rsrpText = assessment.rsrp.map { "RSRP \(Int($0.rounded())) dBm" } ?? assessment.primaryTechLabel
+        let sinrText = assessment.sinr.map { " · SINR \(String(format: "%.1f", $0)) dB" } ?? ""
+        return HStack(spacing: 12) {
+            infoBox(
+                title: "信号强度评级",
+                primary: "\(assessment.grade.rawValue) (\(assessment.score)分)",
+                secondary: "\(rsrpText)\(sinrText)",
+                primaryColor: Formatters.signalGradeColor(assessment.grade)
+            )
             infoBox(title: "本次连接流量", primary: Formatters.byteCount(snap.sessionRxBytes + snap.sessionTxBytes), secondary: "时长 \(Formatters.duration(snap.sessionDurationSeconds))")
             infoBox(title: "本月累计流量", primary: Formatters.byteCount(snap.monthlyRxBytes + snap.monthlyTxBytes), secondary: "↓\(Formatters.byteCount(snap.monthlyRxBytes)) ↑\(Formatters.byteCount(snap.monthlyTxBytes))")
             infoBox(
@@ -204,10 +212,10 @@ private struct SignalOverviewTab: View {
         }
     }
 
-    private func infoBox(title: String, primary: String, secondary: String) -> some View {
+    private func infoBox(title: String, primary: String, secondary: String, primaryColor: Color = .primary) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title).font(.caption).foregroundStyle(.secondary)
-            Text(primary).font(.headline.monospacedDigit())
+            Text(primary).font(.headline.monospacedDigit()).foregroundStyle(primaryColor)
             Text(secondary).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
         }
         .padding(12)

@@ -207,12 +207,6 @@ final class RouterViewModel {
         }
     }
 
-    func restoreDefaultWatchdogEndpoints() {
-        var copy = settings.watchdogConfig
-        copy.endpoints = WatchdogEndpoint.defaultPresets
-        updateWatchdogConfig(copy)
-    }
-
     func runSingleWatchdogProbe() async {
         guard !isProbingOnce else { return }
         let endpoints = settings.watchdogConfig.enabledValidEndpoints
@@ -224,11 +218,7 @@ final class RouterViewModel {
         defer { isProbingOnce = false }
 
         appendWatchdogLog(WatchdogLogEntry(level: .info, message: "手动执行单轮连通性探测（\(endpoints.count) 个端点）…"))
-        let results = await watchdogRunner.probeAll(
-            endpoints: endpoints,
-            timeoutMs: settings.watchdogConfig.checkTimeoutMs,
-            prober: prober
-        )
+        let results = await watchdogRunner.probeAll(endpoints: endpoints, prober: prober)
         let policy = settings.watchdogConfig.triggerPolicy
         let healthy = WatchdogEvaluator.isHealthy(outcomes: results, policy: policy)
         lastProbeOutcomes = results
@@ -473,7 +463,11 @@ final class RouterViewModel {
         defer { isRefreshing = false }
 
         do {
-            let fresh = try await client.fetchStatus(reclaimIfDuplicate: !silent)
+            let needStations = isUIActive || self.snapshot == nil
+            let fresh = try await client.fetchStatus(
+                reclaimIfDuplicate: !silent,
+                includeStationLists: needStations
+            )
             self.snapshot = fresh
             self.recordSignalSample(from: fresh)
             self.lastError = nil

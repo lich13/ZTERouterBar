@@ -177,15 +177,12 @@ public struct ConnectedStation: Equatable, Sendable, Identifiable, Codable {
 }
 
 public struct RouterVersionInfo: Equatable, Sendable {
-    public let hardwareVersion: String
-    public let webVersion: String
     public let waInnerVersion: String
     public let crVersion: String
 }
 
 public struct RouterStatusSnapshot: Equatable, Sendable {
     public let fetchedAt: Date
-    public let rawFields: [String: String]
 
     public let connectionState: WANConnectionState
     public let wanConnectStatus: String
@@ -211,19 +208,15 @@ public struct RouterStatusSnapshot: Equatable, Sendable {
 
     public let cellID: String
     public let nr5gCellID: String
-    public let txPowerText: String
     public let wanIPv4: String
     public let wanIPv6: String
     public let wanAPN: String
     public let dnsMode: String
     public let preferDNSManual: String
     public let standbyDNSManual: String
-    public let ipPassthroughEnabled: String
     public let currentNetworkMode: String
     public let opmsWanMode: String
 
-    public let rxBytesPerSec: Double
-    public let txBytesPerSec: Double
     public let sessionDurationSeconds: Int
     public let sessionRxBytes: UInt64
     public let sessionTxBytes: UInt64

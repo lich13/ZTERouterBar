@@ -60,8 +60,6 @@ struct ZTERouterCoreTests {
         {
           "wa_inner_version": "BD_FLYMODEMMU5120V1.0.1B12",
           "cr_version": "",
-          "hardware_version": "MU5120_HWV2.0",
-          "web_version": "WEB_TEST_1.0",
           "ppp_status": "ipv4_ipv6_connected",
           "wan_connect_status": "pdp_connected",
           "network_type": "SA",
@@ -88,8 +86,6 @@ struct ZTERouterCoreTests {
         let mu5120JSON2 = """
         {
           "net_select": "Only_5G",
-          "realtime_tx_thrpt": "15409",
-          "realtime_rx_thrpt": "10007",
           "realtime_time": "20613",
           "battery_value": "100",
           "battery_charging": "2",
@@ -221,6 +217,16 @@ struct ZTERouterCoreTests {
         #expect(stationQueries.count == 1)
         #expect(!(stationQueries[0].url?.absoluteString.contains("multi_data=1") ?? true))
 
+        // Background poll skips `station_list` and `lan_station_list` while keeping `wifi_access_sta_num`.
+        let bgSnap = try await client.fetchStatus(includeStationLists: false)
+        #expect(bgSnap.wirelessDeviceCount == 6)
+        #expect(bgSnap.wifiStations.isEmpty)
+        let capturedAfterBG = await transport.capturedRequests
+        let stationQueriesAfterBG = capturedAfterBG.filter {
+            $0.httpMethod == "GET" && ($0.url?.absoluteString.contains("cmd=station_list") ?? false)
+        }
+        #expect(stationQueriesAfterBG.count == 1)
+
         let postGoforms = captured.compactMap { req -> String? in
             guard req.httpMethod == "POST", let body = req.httpBody, let text = String(data: body, encoding: .utf8) else { return nil }
             return text.split(separator: "&").first(where: { $0.hasPrefix("goformId=") }).map(String.init)
@@ -241,80 +247,74 @@ struct ZTERouterCoreTests {
         }
     }
 
-    @Test("Watchdog config defaults, presets, legacy migration, and weighted policy evaluation")
+    @Test("Watchdog config defaults, per-endpoint seconds, legacy migration, and weighted policy evaluation")
     func testWatchdogConfigAndPolicies() throws {
         let cfg = WatchdogConfig()
         #expect(cfg.autoStart == true)
         #expect(cfg.triggerPolicy == .weighted)
-        #expect(cfg.checkTimeoutMs == 4000)
-        #expect(cfg.pollIntervalSec == 33)
         #expect(cfg.recheckBeforeAct == 1)
         #expect(cfg.recheckIntervalSec == 3)
         #expect(cfg.endpoints.count == 3)
-        #expect(cfg.endpoints[0].urlString == "https://661313.xyz/test/success.txt")
+        #expect(cfg.endpoints[0].urlString == "https://661313.xyz/test/generate_204")
         #expect(cfg.endpoints[0].weight == 3)
-        #expect(cfg.endpoints[0].expectedResponseText == "success")
+        #expect(cfg.endpoints[0].intervalSec == 15)
+        #expect(cfg.endpoints[0].timeoutSec == 3)
         #expect(cfg.endpoints[1].weight == 1)
+        #expect(cfg.endpoints[1].intervalSec == 33)
+        #expect(cfg.endpoints[1].timeoutSec == 4)
         #expect(cfg.endpoints[2].weight == 1)
-        #expect(cfg.endpoints.allSatisfy {
-            $0.isValidHTTPURL
-                && $0.urlString.hasPrefix("https://")
-                && $0.proxyMode == .system
-                && $0.proxyHost == "127.0.0.1"
-                && $0.proxyPort == 7890
-        })
-        #expect(!cfg.endpoints.contains(where: { $0.urlString.contains("github") || $0.urlString.contains("dropbox") }))
+        #expect(cfg.endpoints[2].intervalSec == 33)
+        #expect(cfg.endpoints[2].timeoutSec == 4)
+        #expect(cfg.endpoints.allSatisfy { $0.isValidHTTPURL && $0.urlString.hasPrefix("https://") })
+        #expect(!cfg.endpoints.contains(where: { $0.urlString.contains("success.txt") || $0.urlString.contains("github") || $0.urlString.contains("dropbox") }))
 
-        // Backwards-compatible decoding without weight/expectedResponseText
-        let minimalJSON = Data("""
-        {"id":"00000000-0000-0000-0000-000000000001","isEnabled":true,"name":"Legacy","urlString":"https://example.invalid","proxyMode":"system","proxyHost":"127.0.0.1","proxyPort":7890,"proxyUsername":"","proxyPassword":""}
+        // Backwards-compatible decoding of v1.0.4 JSON with global checkTimeoutMs / pollIntervalSec & proxy keys
+        let v104JSON = Data("""
+        {
+          "autoStart": true,
+          "checkTimeoutMs": 5000,
+          "pollIntervalSec": 25,
+          "recheckBeforeAct": 1,
+          "recheckIntervalSec": 3,
+          "maxConsecutiveReconnects": 3,
+          "cooldownSec": 60,
+          "triggerPolicy": "weighted",
+          "onlyWhenWiFiMatched": false,
+          "endpoints": [
+            {"id":"00000000-0000-0000-0000-000000000001","isEnabled":true,"name":"661313 节点","urlString":"https://661313.xyz/test/success.txt","proxyMode":"system","weight":3,"expectedResponseText":"success"},
+            {"id":"00000000-0000-0000-0000-000000000002","isEnabled":true,"name":"Custom","urlString":"https://custom.invalid/ping","proxyMode":"socks5","weight":1}
+          ]
+        }
         """.utf8)
-        let decodedLegacy = try JSONDecoder().decode(WatchdogEndpoint.self, from: minimalJSON)
-        #expect(decodedLegacy.weight == 1)
-        #expect(decodedLegacy.expectedResponseText.isEmpty)
+        let decoded104 = try JSONDecoder().decode(WatchdogConfig.self, from: v104JSON)
+        #expect(decoded104.endpoints[1].intervalSec == 25)
+        #expect(decoded104.endpoints[1].timeoutSec == 5)
+        let migrated104 = decoded104.migratingLegacyDefaults(fromVersion: 3)
+        #expect(migrated104.endpoints[0].urlString == "https://661313.xyz/test/generate_204")
+        #expect(migrated104.endpoints[0].intervalSec == 15)
+        #expect(migrated104.endpoints[0].timeoutSec == 3)
+        #expect(migrated104.endpoints[1].intervalSec == 25)
+        #expect(migrated104.endpoints[1].timeoutSec == 5)
 
-        // Legacy v1.0.2 & v1.0.3 migrations
-        let legacy102 = WatchdogConfig(
-            pollIntervalSec: 15,
-            recheckBeforeAct: 3,
-            triggerPolicy: .allUnreachable,
-            endpoints: WatchdogEndpoint.legacyV102PresetURLs.map { WatchdogEndpoint(name: "Legacy", urlString: $0) }
-        ).migratingLegacyDefaults(fromVersion: 0)
-        #expect(legacy102.pollIntervalSec == 33)
-        #expect(legacy102.recheckBeforeAct == 1)
-        #expect(legacy102.triggerPolicy == .weighted)
-        #expect(legacy102.endpoints.map(\.urlString) == WatchdogEndpoint.defaultPresets.map(\.urlString))
-
-        let legacy103 = WatchdogConfig(
-            pollIntervalSec: 33,
-            recheckBeforeAct: 3,
-            triggerPolicy: .allUnreachable,
-            endpoints: WatchdogEndpoint.legacyV103PresetURLs.map { WatchdogEndpoint(name: "Legacy103", urlString: $0) }
-        ).migratingLegacyDefaults(fromVersion: 2)
-        #expect(legacy103.recheckBeforeAct == 1)
-        #expect(legacy103.triggerPolicy == .weighted)
-        #expect(legacy103.endpoints.map(\.urlString) == WatchdogEndpoint.defaultPresets.map(\.urlString))
-
-        let userCustom = WatchdogConfig(
-            pollIntervalSec: 20,
-            recheckBeforeAct: 2,
-            triggerPolicy: .anyUnreachable,
-            endpoints: [WatchdogEndpoint(name: "Custom", urlString: "https://example.invalid")]
-        )
-        let kept = userCustom.migratingLegacyDefaults(fromVersion: 2)
-        #expect(kept.pollIntervalSec == 20)
-        #expect(kept.recheckBeforeAct == 2)
-        #expect(kept.triggerPolicy == .anyUnreachable)
-        #expect(kept.endpoints.contains(where: { $0.urlString == "https://example.invalid" }))
-        #expect(kept.endpoints.contains(where: { $0.urlString == "https://661313.xyz/test/success.txt" && $0.weight == 3 }))
+        // Legacy untouched preset sets migrate cleanly to v1.1.0 defaults
+        for oldURLs in WatchdogEndpoint.legacyPresetURLSets {
+            let legacy = WatchdogConfig(
+                recheckBeforeAct: 3,
+                triggerPolicy: .allUnreachable,
+                endpoints: oldURLs.map { WatchdogEndpoint(name: "Legacy", urlString: $0) }
+            ).migratingLegacyDefaults(fromVersion: 0)
+            #expect(legacy.recheckBeforeAct == 1)
+            #expect(legacy.triggerPolicy == .weighted)
+            #expect(legacy.endpoints.map(\.urlString) == WatchdogEndpoint.defaultPresets.map(\.urlString))
+        }
 
         // Weighted evaluation: primary (3) dominates two secondaries (1 + 1)
-        let primaryOK = EndpointProbeOutcome(id: UUID(), name: "661313", urlString: "https://example.invalid", proxyMode: .system, weight: 3, reachable: true, statusCode: 200, elapsedMs: 30)
-        let primaryFail = EndpointProbeOutcome(id: UUID(), name: "661313", urlString: "https://example.invalid", proxyMode: .system, weight: 3, reachable: false, errorMessage: "timeout")
-        let sec1OK = EndpointProbeOutcome(id: UUID(), name: "S1", urlString: "https://example.invalid", proxyMode: .system, weight: 1, reachable: true, statusCode: 204, elapsedMs: 50)
-        let sec1Fail = EndpointProbeOutcome(id: UUID(), name: "S1", urlString: "https://example.invalid", proxyMode: .system, weight: 1, reachable: false, errorMessage: "timeout")
-        let sec2OK = EndpointProbeOutcome(id: UUID(), name: "S2", urlString: "https://example.invalid", proxyMode: .system, weight: 1, reachable: true, statusCode: 200, elapsedMs: 40)
-        let sec2Fail = EndpointProbeOutcome(id: UUID(), name: "S2", urlString: "https://example.invalid", proxyMode: .system, weight: 1, reachable: false, errorMessage: "timeout")
+        let primaryOK = EndpointProbeOutcome(id: UUID(), name: "661313", urlString: "https://example.invalid", weight: 3, reachable: true, statusCode: 204, elapsedMs: 30)
+        let primaryFail = EndpointProbeOutcome(id: UUID(), name: "661313", urlString: "https://example.invalid", weight: 3, reachable: false, errorMessage: "timeout")
+        let sec1OK = EndpointProbeOutcome(id: UUID(), name: "S1", urlString: "https://example.invalid", weight: 1, reachable: true, statusCode: 204, elapsedMs: 50)
+        let sec1Fail = EndpointProbeOutcome(id: UUID(), name: "S1", urlString: "https://example.invalid", weight: 1, reachable: false, errorMessage: "timeout")
+        let sec2OK = EndpointProbeOutcome(id: UUID(), name: "S2", urlString: "https://example.invalid", weight: 1, reachable: true, statusCode: 200, elapsedMs: 40)
+        let sec2Fail = EndpointProbeOutcome(id: UUID(), name: "S2", urlString: "https://example.invalid", weight: 1, reachable: false, errorMessage: "timeout")
 
         #expect(WatchdogEvaluator.isHealthy(outcomes: [primaryOK, sec1Fail, sec2Fail], policy: .weighted) == true)
         #expect(WatchdogEvaluator.isHealthy(outcomes: [primaryFail, sec1OK, sec2OK], policy: .weighted) == false)
@@ -322,6 +322,36 @@ struct ZTERouterCoreTests {
         #expect(WatchdogEvaluator.isHealthy(outcomes: [primaryFail, sec1Fail, sec2Fail], policy: .allUnreachable) == false)
         #expect(WatchdogEvaluator.isHealthy(outcomes: [primaryOK, sec1Fail], policy: .anyUnreachable) == false)
         #expect(WatchdogEvaluator.isHealthy(outcomes: [primaryOK, sec1OK], policy: .anyUnreachable) == true)
+    }
+
+    @Test("Watchdog schedules per-endpoint independent intervals cleanly")
+    func testPerEndpointScheduling() async {
+        let fast = WatchdogEndpoint(name: "Fast", urlString: "https://fast.invalid", weight: 3, intervalSec: 15, timeoutSec: 3)
+        let slow = WatchdogEndpoint(name: "Slow", urlString: "https://slow.invalid", weight: 1, intervalSec: 33, timeoutSec: 4)
+        var cfg = WatchdogConfig(recheckBeforeAct: 1, triggerPolicy: .weighted)
+        cfg.endpoints = [fast, slow]
+
+        let counter = EndpointCallCounter()
+        let prober = CountingProber(counter: counter)
+        let router = MockReconnectRouter()
+        let runner = WatchdogRunner(sleep: { _ in try await Task.sleep(for: .milliseconds(5)) })
+
+        let task = Task {
+            await runner.run(config: cfg, prober: prober, router: router) { _ in }
+        }
+
+        // Wait until Fast reaches at least 4 probes (t=0, 15, 30, 45)
+        for _ in 0..<100 {
+            if await counter.count(for: fast.id) >= 4 { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        task.cancel()
+        await task.value
+
+        let fastCount = await counter.count(for: fast.id)
+        let slowCount = await counter.count(for: slow.id)
+        #expect(fastCount >= 4)
+        #expect(slowCount >= 2 && slowCount < fastCount)
     }
 
     @Test("Watchdog ignores transient jitter when recheck recovers")
@@ -443,7 +473,18 @@ struct ZTERouterCoreTests {
         let sample = try #require(SignalEvaluator.sample(from: snap1))
         #expect(sample.rsrp == -84)
         #expect(sample.sinr == 21.0)
-        #expect(sample.grade == .excellent || sample.grade == .good)
+
+        let mu5120SampleJSON = Data("""
+        {"ppp_status":"ipv4_ipv6_connected","network_type":"SA","nr5g_action_band":"n41","5g_rx0_rsrp":"-69","Z5g_SINR":"23.5","Z5g_rsrq":"-12"}
+        """.utf8)
+        let strongSnap = try RouterStatusParser.parse(jsonDataList: [mu5120SampleJSON])
+        #expect(SignalEvaluator.menuBarSignalText(for: strongSnap) == "-69dBm 极佳")
+
+        let disconnectedJSON = Data("""
+        {"ppp_status":"ppp_disconnected","network_type":"SA","5g_rx0_rsrp":"-69"}
+        """.utf8)
+        let offlineSnap = try RouterStatusParser.parse(jsonDataList: [disconnectedJSON])
+        #expect(SignalEvaluator.menuBarSignalText(for: offlineSnap) == "断网")
 
         let beforeIP = WANIPSnapshot(snapshot: snap1)
         let afterIP = WANIPSnapshot(ipv4: "10.10.0.2", ipv6: "2001:db8::2")
@@ -471,18 +512,13 @@ struct ZTERouterCoreTests {
         #expect(manualUnchanged.body.contains("10.10.0.1（未变化）"))
     }
 
-    @Test("URLEndpointProber rejects invalid URL, invalid proxy config, gateway errors, and mismatched body")
+    @Test("URLEndpointProber rejects invalid URL and interprets HTTP gateway failure codes")
     func testProberValidation() async {
         let prober = URLEndpointProber()
         let badURL = WatchdogEndpoint(name: "Bad", urlString: "not-a-url")
-        let out1 = await prober.check(badURL, timeoutMs: 1000)
+        let out1 = await prober.check(badURL)
         #expect(out1.reachable == false)
         #expect(out1.errorMessage?.isEmpty == false)
-
-        let badProxy = WatchdogEndpoint(name: "BadProxy", urlString: "https://example.invalid", proxyMode: .socks5, proxyHost: "", proxyPort: 1080)
-        let out2 = await prober.check(badProxy, timeoutMs: 1000)
-        #expect(out2.reachable == false)
-        #expect(out2.errorMessage?.contains("SOCKS5") == true)
 
         #expect(URLEndpointProber.failureMessage(forStatusCode: 200) == nil)
         #expect(URLEndpointProber.failureMessage(forStatusCode: 204) == nil)
@@ -491,10 +527,39 @@ struct ZTERouterCoreTests {
         #expect(URLEndpointProber.failureMessage(forStatusCode: 502) != nil)
         #expect(URLEndpointProber.failureMessage(forStatusCode: 503) != nil)
         #expect(URLEndpointProber.failureMessage(forStatusCode: 504) != nil)
+    }
+}
 
-        #expect(URLEndpointProber.validateExpectedBody(data: Data("success\n".utf8), statusCode: 200, expectedText: "success") == nil)
-        #expect(URLEndpointProber.validateExpectedBody(data: Data("<html>blocked</html>".utf8), statusCode: 200, expectedText: "success") != nil)
-        #expect(URLEndpointProber.validateExpectedBody(data: Data("success".utf8), statusCode: 404, expectedText: "success") != nil)
+private actor EndpointCallCounter {
+    private var counts: [UUID: Int] = [:]
+
+    func increment(_ id: UUID) {
+        counts[id, default: 0] += 1
+    }
+
+    func count(for id: UUID) -> Int {
+        counts[id, default: 0]
+    }
+}
+
+private actor CountingProber: EndpointProbing {
+    let counter: EndpointCallCounter
+
+    init(counter: EndpointCallCounter) {
+        self.counter = counter
+    }
+
+    func check(_ endpoint: WatchdogEndpoint) async -> EndpointProbeOutcome {
+        await counter.increment(endpoint.id)
+        return EndpointProbeOutcome(
+            id: endpoint.id,
+            name: endpoint.displayTitle,
+            urlString: endpoint.urlString,
+            weight: endpoint.weight,
+            reachable: true,
+            statusCode: 204,
+            elapsedMs: 10
+        )
     }
 }
 
@@ -506,7 +571,7 @@ private actor ScriptedProber: EndpointProbing {
         self.roundResults = roundResults
     }
 
-    func check(_ endpoint: WatchdogEndpoint, timeoutMs: Int) async -> EndpointProbeOutcome {
+    func check(_ endpoint: WatchdogEndpoint) async -> EndpointProbeOutcome {
         let idx = completedRounds
         completedRounds += 1
         let ok = idx < roundResults.count ? roundResults[idx] : true
@@ -514,7 +579,7 @@ private actor ScriptedProber: EndpointProbing {
             id: endpoint.id,
             name: endpoint.displayTitle,
             urlString: endpoint.urlString,
-            proxyMode: endpoint.proxyMode,
+            weight: endpoint.weight,
             reachable: ok,
             statusCode: ok ? 204 : nil,
             elapsedMs: 12,

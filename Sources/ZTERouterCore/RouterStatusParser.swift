@@ -1,20 +1,19 @@
 import Foundation
 
 public enum RouterStatusParser {
-    /// Core signal, connection, and station count fields queried with `multi_data=1`.
+    /// Core signal, connection, and radio fields queried with `multi_data=1`.
     public static let primarySignalCmds: [String] = [
-        "wa_inner_version", "cr_version", "hardware_version", "web_version",
+        "wa_inner_version", "cr_version",
         "ppp_status", "wan_connect_status", "modem_main_state",
         "network_type", "network_provider", "network_provider_fullname", "rmcc", "rmnc", "mdm_mcc", "mdm_mnc",
-        "wan_active_band", "wan_active_channel", "wan_lte_ca", "wan_apn", "wan_ipaddr", "ipv6_wan_ipaddr",
-        "cell_id", "dns_mode", "prefer_dns_manual", "standby_dns_manual", "ip_passthrough_enabled",
-        "bandwidth", "tx_power",
+        "wan_active_channel", "wan_lte_ca", "wan_apn", "wan_ipaddr", "ipv6_wan_ipaddr",
+        "cell_id", "dns_mode", "prefer_dns_manual", "standby_dns_manual",
+        "bandwidth",
         "rscp_1", "ecio_1", "rscp_2", "ecio_2", "rscp_3", "ecio_3", "rscp_4", "ecio_4",
         "ngbr_cell_info",
         "lte_multi_ca_scell_info", "lte_multi_ca_scell_sig_info",
         "lte_band", "lte_rsrp", "lte_rsrq", "lte_rssi", "lte_snr",
         "lte_ca_pcell_band", "lte_ca_pcell_freq", "lte_ca_pcell_bandwidth",
-        "lte_ca_scell_band", "lte_ca_scell_bandwidth",
         "lte_rsrp_1", "lte_rsrp_2", "lte_rsrp_3", "lte_rsrp_4",
         "lte_snr_1", "lte_snr_2", "lte_snr_3", "lte_snr_4",
         "lte_pci",
@@ -25,11 +24,11 @@ public enum RouterStatusParser {
         "pm_sensor_ambient", "pm_sensor_mdm", "pm_sensor_5g", "pm_modem_5g", "pm_sensor_pa1", "wifi_chip_temp"
     ]
 
-    /// Dashboard throughput, traffic, battery, and `wifi_access_sta_num` queried with `multi_data=1`.
+    /// Dashboard traffic, battery, and `wifi_access_sta_num` queried with `multi_data=1`.
     /// Note: `station_list` and `lan_station_list` must be fetched separately WITHOUT `multi_data=1`.
     public static let secondaryDashboardCmds: [String] = [
         "net_select", "opms_wan_mode",
-        "realtime_tx_thrpt", "realtime_rx_thrpt", "realtime_time",
+        "realtime_time",
         "realtime_tx_bytes", "realtime_rx_bytes", "monthly_tx_bytes", "monthly_rx_bytes",
         "battery_value", "battery_charging", "signalbar",
         "wifi_access_sta_num",
@@ -100,15 +99,6 @@ public enum RouterStatusParser {
         let neighborCells = parseNeighborCells(raw: field("ngbr_cell_info"), isLTE: isLTE)
         let temperatures = parseTemperatures(field: field)
 
-        let txPowerRaw = field("tx_power")
-        let txPowerText: String
-        if !txPowerRaw.isEmpty, isLTE, !is5GNSA, let dbm = Double(txPowerRaw) {
-            let mw = pow(10.0, dbm / 10.0)
-            txPowerText = String(format: "%.1f dBm (%.3f mW)", dbm, mw)
-        } else {
-            txPowerText = ""
-        }
-
         let providerFull = field("network_provider_fullname")
         let providerShort = field("network_provider")
         let providerName = !providerFull.isEmpty ? providerFull : providerShort
@@ -134,7 +124,6 @@ public enum RouterStatusParser {
 
         return RouterStatusSnapshot(
             fetchedAt: fetchedAt,
-            rawFields: rawStrings,
             connectionState: WANConnectionState(pppStatus: field("ppp_status")),
             wanConnectStatus: field("wan_connect_status"),
             modemMainState: field("modem_main_state"),
@@ -156,18 +145,14 @@ public enum RouterStatusParser {
             temperatures: temperatures,
             cellID: field("cell_id"),
             nr5gCellID: nr5gCellID,
-            txPowerText: txPowerText,
             wanIPv4: field("wan_ipaddr"),
             wanIPv6: field("ipv6_wan_ipaddr"),
             wanAPN: field("wan_apn"),
             dnsMode: field("dns_mode"),
             preferDNSManual: field("prefer_dns_manual"),
             standbyDNSManual: field("standby_dns_manual"),
-            ipPassthroughEnabled: field("ip_passthrough_enabled"),
             currentNetworkMode: field("net_select"),
             opmsWanMode: field("opms_wan_mode"),
-            rxBytesPerSec: Double(field("realtime_rx_thrpt")) ?? 0,
-            txBytesPerSec: Double(field("realtime_tx_thrpt")) ?? 0,
             sessionDurationSeconds: Int(field("realtime_time")) ?? 0,
             sessionRxBytes: UInt64(field("realtime_rx_bytes")) ?? 0,
             sessionTxBytes: UInt64(field("realtime_tx_bytes")) ?? 0,
@@ -182,8 +167,6 @@ public enum RouterStatusParser {
             wifiStations: wifiStations,
             lanStations: lanStations,
             versionInfo: RouterVersionInfo(
-                hardwareVersion: field("hardware_version"),
-                webVersion: field("web_version"),
                 waInnerVersion: waInnerVersion,
                 crVersion: field("cr_version")
             )

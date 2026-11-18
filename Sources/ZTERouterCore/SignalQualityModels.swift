@@ -42,29 +42,20 @@ public struct SignalSample: Identifiable, Equatable, Sendable {
     public let timestamp: Date
     public let rsrp: Double?
     public let sinr: Double?
-    public let lteRsrp: Double?
     public let score: Int
-    public let grade: SignalQualityGrade
-    public let bandLabel: String
 
     public init(
         id: UUID = UUID(),
         timestamp: Date = Date(),
         rsrp: Double?,
         sinr: Double?,
-        lteRsrp: Double? = nil,
-        score: Int,
-        grade: SignalQualityGrade,
-        bandLabel: String = ""
+        score: Int
     ) {
         self.id = id
         self.timestamp = timestamp
         self.rsrp = rsrp
         self.sinr = sinr
-        self.lteRsrp = lteRsrp
         self.score = score
-        self.grade = grade
-        self.bandLabel = bandLabel
     }
 }
 
@@ -118,19 +109,27 @@ public enum SignalEvaluator {
         if assessment.grade == .unknown && assessment.rsrp == nil && assessment.sinr == nil {
             return nil
         }
-        let lteAnchorRSRP: Double? = {
-            guard !snapshot.nrCells.isEmpty, let lte = snapshot.lteCells.first else { return nil }
-            return lte.rsrpList.first.flatMap(Double.init)
-        }()
         return SignalSample(
             timestamp: snapshot.fetchedAt,
             rsrp: assessment.rsrp,
             sinr: assessment.sinr,
-            lteRsrp: lteAnchorRSRP,
-            score: assessment.score,
-            grade: assessment.grade,
-            bandLabel: snapshot.bandSummary.isEmpty ? assessment.primaryTechLabel : snapshot.bandSummary
+            score: assessment.score
         )
+    }
+
+    public static func menuBarSignalText(for snapshot: RouterStatusSnapshot) -> String {
+        guard snapshot.connectionState.isConnected else { return "断网" }
+        let assessment = assess(snapshot: snapshot)
+        if let rsrp = assessment.rsrp {
+            return "\(Int(rsrp.rounded()))dBm \(assessment.grade.rawValue)"
+        }
+        if let bars = snapshot.signalBars, assessment.grade != .unknown {
+            return "\(bars)格 \(assessment.grade.rawValue)"
+        }
+        if assessment.grade != .unknown {
+            return assessment.grade.rawValue
+        }
+        return snapshot.networkType.isEmpty ? "在线" : snapshot.networkType
     }
 
     public static func evaluate(

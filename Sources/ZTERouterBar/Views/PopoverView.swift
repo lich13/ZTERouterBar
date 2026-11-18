@@ -292,22 +292,17 @@ struct PopoverView: View {
             }
 
             if let snap = viewModel.snapshot {
+                let assessment = SignalEvaluator.assess(snapshot: snap)
+                let gradeColor = Formatters.signalGradeColor(assessment.grade)
                 Divider()
                 HStack(spacing: 10) {
                     Label {
-                        Text("↓ \(Formatters.speedBits(snap.rxBytesPerSec))")
-                            .font(.caption.monospacedDigit())
+                        Text(SignalEvaluator.menuBarSignalText(for: snap))
+                            .font(.caption.monospacedDigit().weight(.medium))
+                            .foregroundStyle(gradeColor)
                     } icon: {
-                        Image(systemName: "arrow.down.circle.fill")
-                            .foregroundStyle(.blue)
-                    }
-
-                    Label {
-                        Text("↑ \(Formatters.speedBits(snap.txBytesPerSec))")
-                            .font(.caption.monospacedDigit())
-                    } icon: {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .foregroundStyle(.teal)
+                        Image(systemName: "cellularbars")
+                            .foregroundStyle(gradeColor)
                     }
 
                     Spacer()

@@ -1,32 +1,5 @@
 import Foundation
 
-public enum EndpointProxyMode: String, CaseIterable, Codable, Sendable, Identifiable {
-    case system
-    case direct
-    case http
-    case socks5
-
-    public var id: String { rawValue }
-
-    public var displayName: String {
-        switch self {
-        case .system: "跟随系统代理"
-        case .direct: "直连 (无代理)"
-        case .http: "HTTP 代理"
-        case .socks5: "SOCKS5 代理"
-        }
-    }
-
-    public var shortName: String {
-        switch self {
-        case .system: "系统代理"
-        case .direct: "直连"
-        case .http: "HTTP"
-        case .socks5: "SOCKS5"
-        }
-    }
-}
-
 public enum WatchdogTriggerPolicy: String, CaseIterable, Codable, Sendable, Identifiable {
     case weighted
     case allUnreachable
@@ -48,16 +21,16 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
     public var isEnabled: Bool
     public var name: String
     public var urlString: String
-    public var proxyMode: EndpointProxyMode
-    public var proxyHost: String
-    public var proxyPort: Int
-    public var proxyUsername: String
-    public var proxyPassword: String
     public var weight: Int
-    public var expectedResponseText: String
+    public var intervalSec: Int
+    public var timeoutSec: Int
+
+    public static let defaultWeight = 1
+    public static let defaultIntervalSec = 33
+    public static let defaultTimeoutSec = 4
 
     enum CodingKeys: String, CodingKey {
-        case id, isEnabled, name, urlString, proxyMode, proxyHost, proxyPort, proxyUsername, proxyPassword, weight, expectedResponseText
+        case id, isEnabled, name, urlString, weight, intervalSec, timeoutSec
     }
 
     public init(
@@ -65,25 +38,17 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
         isEnabled: Bool = true,
         name: String = "",
         urlString: String = "",
-        proxyMode: EndpointProxyMode = .system,
-        proxyHost: String = "127.0.0.1",
-        proxyPort: Int = 7890,
-        proxyUsername: String = "",
-        proxyPassword: String = "",
-        weight: Int = 1,
-        expectedResponseText: String = ""
+        weight: Int = WatchdogEndpoint.defaultWeight,
+        intervalSec: Int = WatchdogEndpoint.defaultIntervalSec,
+        timeoutSec: Int = WatchdogEndpoint.defaultTimeoutSec
     ) {
         self.id = id
         self.isEnabled = isEnabled
         self.name = name
         self.urlString = urlString
-        self.proxyMode = proxyMode
-        self.proxyHost = proxyHost
-        self.proxyPort = proxyPort
-        self.proxyUsername = proxyUsername
-        self.proxyPassword = proxyPassword
         self.weight = min(max(weight, 1), 10)
-        self.expectedResponseText = expectedResponseText
+        self.intervalSec = min(max(intervalSec, 5), 3600)
+        self.timeoutSec = min(max(timeoutSec, 1), 30)
     }
 
     public init(from decoder: Decoder) throws {
@@ -92,13 +57,9 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
         isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
         name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
         urlString = try container.decodeIfPresent(String.self, forKey: .urlString) ?? ""
-        proxyMode = try container.decodeIfPresent(EndpointProxyMode.self, forKey: .proxyMode) ?? .system
-        proxyHost = try container.decodeIfPresent(String.self, forKey: .proxyHost) ?? "127.0.0.1"
-        proxyPort = try container.decodeIfPresent(Int.self, forKey: .proxyPort) ?? 7890
-        proxyUsername = try container.decodeIfPresent(String.self, forKey: .proxyUsername) ?? ""
-        proxyPassword = try container.decodeIfPresent(String.self, forKey: .proxyPassword) ?? ""
-        weight = min(max(try container.decodeIfPresent(Int.self, forKey: .weight) ?? 1, 1), 10)
-        expectedResponseText = try container.decodeIfPresent(String.self, forKey: .expectedResponseText) ?? ""
+        weight = min(max(try container.decodeIfPresent(Int.self, forKey: .weight) ?? Self.defaultWeight, 1), 10)
+        intervalSec = min(max(try container.decodeIfPresent(Int.self, forKey: .intervalSec) ?? Self.defaultIntervalSec, 5), 3600)
+        timeoutSec = min(max(try container.decodeIfPresent(Int.self, forKey: .timeoutSec) ?? Self.defaultTimeoutSec, 1), 30)
     }
 
     public var isValidHTTPURL: Bool {
@@ -121,45 +82,63 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
         return urlString.isEmpty ? "未命名端点" : urlString
     }
 
+    public func clamped() -> WatchdogEndpoint {
+        WatchdogEndpoint(
+            id: id,
+            isEnabled: isEnabled,
+            name: name,
+            urlString: urlString,
+            weight: weight,
+            intervalSec: intervalSec,
+            timeoutSec: timeoutSec
+        )
+    }
+
     /// URLs shipped in earlier versions, used only for one-time migration of untouched configs.
-    public static let legacyV102PresetURLs: [String] = [
-        "https://cp.cloudflare.com/generate_204",
-        "https://www.gstatic.com/generate_204",
-        "https://captive.apple.com/hotspot-detect.html"
+    public static let legacyPresetURLSets: [[String]] = [
+        [
+            "https://cp.cloudflare.com/generate_204",
+            "https://www.gstatic.com/generate_204",
+            "https://captive.apple.com/hotspot-detect.html"
+        ],
+        [
+            "https://www.youtube.com/generate_204",
+            "https://cloudflare-dns.com/cdn-cgi/trace",
+            "https://github.githubassets.com/favicons/favicon.svg",
+            "https://www.dropbox.com/robots.txt"
+        ],
+        [
+            "https://661313.xyz/test/success.txt",
+            "https://www.youtube.com/generate_204",
+            "https://cloudflare-dns.com/cdn-cgi/trace"
+        ]
     ]
 
-    public static let legacyV103PresetURLs: [String] = [
-        "https://www.youtube.com/generate_204",
-        "https://cloudflare-dns.com/cdn-cgi/trace",
-        "https://github.githubassets.com/favicons/favicon.svg",
-        "https://www.dropbox.com/robots.txt"
-    ]
-
-    /// Highest-weight primary self-hosted probe (`661313.xyz/test/success.txt`, returning uncached `200 success`)
-    /// paired with secondary GFW-listed probes (`YouTube 204`, `Cloudflare DoH`).
     public static var defaultPresets: [WatchdogEndpoint] {
         [
             WatchdogEndpoint(
                 isEnabled: true,
-                name: "661313 节点",
-                urlString: "https://661313.xyz/test/success.txt",
-                proxyMode: .system,
+                name: "661313 204",
+                urlString: "https://661313.xyz/test/generate_204",
                 weight: 3,
-                expectedResponseText: "success"
+                intervalSec: 15,
+                timeoutSec: 3
             ),
             WatchdogEndpoint(
                 isEnabled: true,
                 name: "YouTube 204",
                 urlString: "https://www.youtube.com/generate_204",
-                proxyMode: .system,
-                weight: 1
+                weight: 1,
+                intervalSec: 33,
+                timeoutSec: 4
             ),
             WatchdogEndpoint(
                 isEnabled: true,
                 name: "Cloudflare DoH",
                 urlString: "https://cloudflare-dns.com/cdn-cgi/trace",
-                proxyMode: .system,
-                weight: 1
+                weight: 1,
+                intervalSec: 33,
+                timeoutSec: 4
             )
         ]
     }
@@ -167,8 +146,6 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
 
 public struct WatchdogConfig: Codable, Equatable, Sendable {
     public var autoStart: Bool
-    public var checkTimeoutMs: Int
-    public var pollIntervalSec: Int
     public var recheckBeforeAct: Int
     public var recheckIntervalSec: Int
     public var maxConsecutiveReconnects: Int
@@ -177,17 +154,19 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
     public var onlyWhenWiFiMatched: Bool
     public var endpoints: [WatchdogEndpoint]
 
-    public static let defaultCheckTimeoutMs = 4000
-    public static let defaultPollIntervalSec = 33
     public static let defaultRecheckBeforeAct = 1
     public static let defaultRecheckIntervalSec = 3
     public static let defaultMaxConsecutiveReconnects = 3
     public static let defaultCooldownSec = 60
 
+    enum CodingKeys: String, CodingKey {
+        case autoStart, recheckBeforeAct, recheckIntervalSec, maxConsecutiveReconnects, cooldownSec, triggerPolicy, onlyWhenWiFiMatched, endpoints
+        // Legacy keys decoded only when upgrading older persisted configs that lack per-endpoint timing.
+        case checkTimeoutMs, pollIntervalSec
+    }
+
     public init(
         autoStart: Bool = true,
-        checkTimeoutMs: Int = WatchdogConfig.defaultCheckTimeoutMs,
-        pollIntervalSec: Int = WatchdogConfig.defaultPollIntervalSec,
         recheckBeforeAct: Int = WatchdogConfig.defaultRecheckBeforeAct,
         recheckIntervalSec: Int = WatchdogConfig.defaultRecheckIntervalSec,
         maxConsecutiveReconnects: Int = WatchdogConfig.defaultMaxConsecutiveReconnects,
@@ -197,8 +176,6 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
         endpoints: [WatchdogEndpoint] = WatchdogEndpoint.defaultPresets
     ) {
         self.autoStart = autoStart
-        self.checkTimeoutMs = checkTimeoutMs
-        self.pollIntervalSec = pollIntervalSec
         self.recheckBeforeAct = recheckBeforeAct
         self.recheckIntervalSec = recheckIntervalSec
         self.maxConsecutiveReconnects = maxConsecutiveReconnects
@@ -206,6 +183,40 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
         self.triggerPolicy = triggerPolicy
         self.onlyWhenWiFiMatched = onlyWhenWiFiMatched
         self.endpoints = endpoints
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        autoStart = try container.decodeIfPresent(Bool.self, forKey: .autoStart) ?? true
+        recheckBeforeAct = try container.decodeIfPresent(Int.self, forKey: .recheckBeforeAct) ?? Self.defaultRecheckBeforeAct
+        recheckIntervalSec = try container.decodeIfPresent(Int.self, forKey: .recheckIntervalSec) ?? Self.defaultRecheckIntervalSec
+        maxConsecutiveReconnects = try container.decodeIfPresent(Int.self, forKey: .maxConsecutiveReconnects) ?? Self.defaultMaxConsecutiveReconnects
+        cooldownSec = try container.decodeIfPresent(Int.self, forKey: .cooldownSec) ?? Self.defaultCooldownSec
+        triggerPolicy = try container.decodeIfPresent(WatchdogTriggerPolicy.self, forKey: .triggerPolicy) ?? .weighted
+        onlyWhenWiFiMatched = try container.decodeIfPresent(Bool.self, forKey: .onlyWhenWiFiMatched) ?? false
+
+        var decodedEndpoints = try container.decodeIfPresent([WatchdogEndpoint].self, forKey: .endpoints) ?? WatchdogEndpoint.defaultPresets
+        let legacyPollSec = try container.decodeIfPresent(Int.self, forKey: .pollIntervalSec)
+        let legacyTimeoutSec = (try container.decodeIfPresent(Int.self, forKey: .checkTimeoutMs)).map { max(1, Int((Double($0) / 1000.0).rounded())) }
+        if legacyPollSec != nil || legacyTimeoutSec != nil {
+            for idx in decodedEndpoints.indices {
+                if let legacyPollSec { decodedEndpoints[idx].intervalSec = legacyPollSec }
+                if let legacyTimeoutSec { decodedEndpoints[idx].timeoutSec = legacyTimeoutSec }
+            }
+        }
+        endpoints = decodedEndpoints.map { $0.clamped() }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(autoStart, forKey: .autoStart)
+        try container.encode(recheckBeforeAct, forKey: .recheckBeforeAct)
+        try container.encode(recheckIntervalSec, forKey: .recheckIntervalSec)
+        try container.encode(maxConsecutiveReconnects, forKey: .maxConsecutiveReconnects)
+        try container.encode(cooldownSec, forKey: .cooldownSec)
+        try container.encode(triggerPolicy, forKey: .triggerPolicy)
+        try container.encode(onlyWhenWiFiMatched, forKey: .onlyWhenWiFiMatched)
+        try container.encode(endpoints, forKey: .endpoints)
     }
 
     public var enabledValidEndpoints: [WatchdogEndpoint] {
@@ -216,52 +227,36 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
 
     public func clamped() -> WatchdogConfig {
         var copy = self
-        copy.checkTimeoutMs = min(max(checkTimeoutMs, 500), 30000)
-        copy.pollIntervalSec = min(max(pollIntervalSec, 5), 3600)
         copy.recheckBeforeAct = min(max(recheckBeforeAct, 0), 10)
         copy.recheckIntervalSec = min(max(recheckIntervalSec, 1), 60)
         copy.maxConsecutiveReconnects = min(max(maxConsecutiveReconnects, 1), 10)
         copy.cooldownSec = min(max(cooldownSec, 10), 600)
-        for idx in copy.endpoints.indices {
-            copy.endpoints[idx].weight = min(max(copy.endpoints[idx].weight, 1), 10)
-        }
+        copy.endpoints = endpoints.map { $0.clamped() }
         return copy
     }
 
-    /// One-time migration from v1.0.2/v1.0.3 defaults to v1.0.4 weighted `661313.xyz` + 2-fail reconnect defaults.
+    /// One-time migration from v1.0.2–v1.0.4 configs to v1.1.0 per-endpoint seconds and `/test/generate_204`.
     public func migratingLegacyDefaults(fromVersion version: Int) -> WatchdogConfig {
+        guard version < 4 else { return clamped() }
         var copy = self
-        if version < 2 {
-            if copy.endpoints.map(\.urlString) == WatchdogEndpoint.legacyV102PresetURLs {
-                copy.endpoints = WatchdogEndpoint.defaultPresets
+        let currentURLs = copy.endpoints.map(\.urlString)
+        if WatchdogEndpoint.legacyPresetURLSets.contains(currentURLs) {
+            copy.endpoints = WatchdogEndpoint.defaultPresets
+        } else {
+            copy.endpoints.removeAll {
+                $0.urlString.contains("github.githubassets.com") || $0.urlString.contains("dropbox.com/robots.txt")
             }
-            if copy.pollIntervalSec == 15 {
-                copy.pollIntervalSec = WatchdogConfig.defaultPollIntervalSec
+            if let legacyIdx = copy.endpoints.firstIndex(where: { $0.urlString.contains("661313.xyz/test/success.txt") }) {
+                copy.endpoints[legacyIdx].name = "661313 204"
+                copy.endpoints[legacyIdx].urlString = "https://661313.xyz/test/generate_204"
+                copy.endpoints[legacyIdx].weight = max(copy.endpoints[legacyIdx].weight, 3)
+                copy.endpoints[legacyIdx].intervalSec = 15
+                copy.endpoints[legacyIdx].timeoutSec = 3
+            } else if !copy.endpoints.contains(where: { $0.urlString.contains("661313.xyz/test") }) {
+                copy.endpoints.insert(WatchdogEndpoint.defaultPresets[0], at: 0)
             }
         }
         if version < 3 {
-            let currentURLs = copy.endpoints.map(\.urlString)
-            if currentURLs == WatchdogEndpoint.legacyV103PresetURLs || currentURLs == WatchdogEndpoint.legacyV102PresetURLs {
-                copy.endpoints = WatchdogEndpoint.defaultPresets
-            } else {
-                // Remove retired GitHub/Dropbox presets if present and ensure 661313 primary endpoint leads with highest weight.
-                copy.endpoints.removeAll {
-                    $0.urlString.contains("github.githubassets.com") || $0.urlString.contains("dropbox.com/robots.txt")
-                }
-                if !copy.endpoints.contains(where: { $0.urlString.contains("661313.xyz/test/success.txt") }) {
-                    copy.endpoints.insert(
-                        WatchdogEndpoint(
-                            isEnabled: true,
-                            name: "661313 节点",
-                            urlString: "https://661313.xyz/test/success.txt",
-                            proxyMode: .system,
-                            weight: 3,
-                            expectedResponseText: "success"
-                        ),
-                        at: 0
-                    )
-                }
-            }
             if copy.triggerPolicy == .allUnreachable {
                 copy.triggerPolicy = .weighted
             }
@@ -272,12 +267,10 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
         return copy.clamped()
     }
 
-    /// Returns a copy keeping current endpoints while restoring all strategy and timing parameters to recommended defaults.
+    /// Returns a copy keeping current endpoints while restoring all strategy and debounce parameters to defaults.
     public func withDefaultParameters() -> WatchdogConfig {
         WatchdogConfig(
             autoStart: true,
-            checkTimeoutMs: WatchdogConfig.defaultCheckTimeoutMs,
-            pollIntervalSec: WatchdogConfig.defaultPollIntervalSec,
             recheckBeforeAct: WatchdogConfig.defaultRecheckBeforeAct,
             recheckIntervalSec: WatchdogConfig.defaultRecheckIntervalSec,
             maxConsecutiveReconnects: WatchdogConfig.defaultMaxConsecutiveReconnects,
@@ -293,7 +286,6 @@ public struct EndpointProbeOutcome: Equatable, Identifiable, Sendable {
     public let id: UUID
     public let name: String
     public let urlString: String
-    public let proxyMode: EndpointProxyMode
     public let weight: Int
     public let reachable: Bool
     public let statusCode: Int?
@@ -305,7 +297,6 @@ public struct EndpointProbeOutcome: Equatable, Identifiable, Sendable {
         id: UUID,
         name: String,
         urlString: String,
-        proxyMode: EndpointProxyMode,
         weight: Int = 1,
         reachable: Bool,
         statusCode: Int? = nil,
@@ -316,7 +307,6 @@ public struct EndpointProbeOutcome: Equatable, Identifiable, Sendable {
         self.id = id
         self.name = name
         self.urlString = urlString
-        self.proxyMode = proxyMode
         self.weight = max(1, weight)
         self.reachable = reachable
         self.statusCode = statusCode

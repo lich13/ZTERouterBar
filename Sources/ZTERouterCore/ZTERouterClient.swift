@@ -216,17 +216,20 @@ public actor ZTERouterClient {
 
     // MARK: - Status & Station List
 
-    public func fetchStatus(reclaimIfDuplicate: Bool = false) async throws -> RouterStatusSnapshot {
+    public func fetchStatus(
+        reclaimIfDuplicate: Bool = false,
+        includeStationLists: Bool = true
+    ) async throws -> RouterStatusSnapshot {
         try await ensureAuthenticated(reclaimIfDuplicate: reclaimIfDuplicate)
         await keepAliveIfNeeded()
 
-        var snapshot = try await fetchSnapshotOnce()
+        var snapshot = try await fetchSnapshotOnce(includeStationLists: includeStationLists)
 
         // If the session was kicked out between `checkLoggedIn()` and `fetchSnapshotOnce()`,
         // ZTE returns HTTP 200 with empty protected fields. Re-authenticate once and retry.
         if snapshot.isUnauthenticatedEmptySnapshot {
             try await login(reclaimIfDuplicate: reclaimIfDuplicate)
-            snapshot = try await fetchSnapshotOnce()
+            snapshot = try await fetchSnapshotOnce(includeStationLists: includeStationLists)
             if snapshot.isUnauthenticatedEmptySnapshot {
                 throw ZTERouterError.sessionExpired
             }
@@ -239,16 +242,20 @@ public actor ZTERouterClient {
         return snapshot
     }
 
-    private func fetchSnapshotOnce() async throws -> RouterStatusSnapshot {
+    private func fetchSnapshotOnce(includeStationLists: Bool) async throws -> RouterStatusSnapshot {
         let data1 = try await getRawData(RouterStatusParser.primarySignalCmds)
         let data2 = try await getRawData(RouterStatusParser.secondaryDashboardCmds)
-        // ZTE firmware returns array JSON for `station_list` and `lan_station_list` only when queried individually without `multi_data=1`.
-        let wifiStationsData = try? await getRawData(["station_list"])
-        let lanStationsData = try? await getRawData(["lan_station_list"])
-
         var payloads = [data1, data2]
-        if let wifiStationsData { payloads.append(wifiStationsData) }
-        if let lanStationsData { payloads.append(lanStationsData) }
+
+        if includeStationLists {
+            // ZTE firmware returns array JSON for `station_list` and `lan_station_list` only when queried individually without `multi_data=1`.
+            if let wifiStationsData = try? await getRawData(["station_list"]) {
+                payloads.append(wifiStationsData)
+            }
+            if let lanStationsData = try? await getRawData(["lan_station_list"]) {
+                payloads.append(lanStationsData)
+            }
+        }
 
         return try RouterStatusParser.parse(jsonDataList: payloads)
     }

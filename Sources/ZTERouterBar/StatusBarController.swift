@@ -12,6 +12,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
     private var dashboardWindow: NSWindow?
     private var isPopoverShown = false
     private var registeredHotkeyState: Bool?
+    private var lastRenderedSignature: String = ""
 
     init(viewModel: RouterViewModel) {
         self.viewModel = viewModel
@@ -95,42 +96,44 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
 
         let symbolName: String
         let tintColor: NSColor
+        let tintKey: String
 
         let isAutoReconnecting = (viewModel.watchdogPhase == .reconnecting)
         if viewModel.isReconnectingWAN || isAutoReconnecting {
             symbolName = "arrow.triangle.2.circlepath"
             tintColor = .systemOrange
+            tintKey = "orange"
         } else if viewModel.isSessionOccupied {
             symbolName = "exclamationmark.triangle"
             tintColor = .systemOrange
+            tintKey = "orange"
         } else if !viewModel.hasStoredPassword {
             symbolName = "antenna.radiowaves.left.and.right.slash"
             tintColor = .secondaryLabelColor
+            tintKey = "secondary"
         } else if let snap = viewModel.snapshot {
             if snap.connectionState.isConnected {
                 symbolName = "globe"
                 tintColor = .systemGreen
+                tintKey = "green"
             } else if snap.connectionState.isTransitioning {
                 symbolName = "arrow.triangle.2.circlepath"
                 tintColor = .systemOrange
+                tintKey = "orange"
             } else {
                 symbolName = "network.slash"
                 tintColor = .systemRed
+                tintKey = "red"
             }
         } else if viewModel.lastError != nil {
             symbolName = "exclamationmark.triangle"
             tintColor = .systemOrange
+            tintKey = "orange"
         } else {
             symbolName = "antenna.radiowaves.left.and.right"
             tintColor = .labelColor
+            tintKey = "label"
         }
-
-        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
-            .applying(NSImage.SymbolConfiguration(paletteColors: [tintColor]))
-        let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "ZTE Router")?.withSymbolConfiguration(config)
-        image?.isTemplate = false
-        button.image = image
-        button.imagePosition = .imageLeading
 
         let titleText: String
         if viewModel.isReconnectingWAN || viewModel.watchdogPhase == .reconnecting {
@@ -141,6 +144,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
             switch viewModel.settings.menuBarDisplayStyle {
             case .iconOnly:
                 titleText = ""
+            case .iconAndSignal:
+                titleText = " " + SignalEvaluator.menuBarSignalText(for: snap)
             case .iconAndBand:
                 if snap.connectionState.isConnected {
                     let net = snap.is5G ? "5G" : (snap.isLTE ? "4G" : snap.networkType)
@@ -149,19 +154,24 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
                 } else {
                     titleText = " 断网"
                 }
-            case .iconAndSpeed:
-                if snap.connectionState.isConnected {
-                    titleText = " ↓\(Formatters.compactSpeed(snap.rxBytesPerSec)) ↑\(Formatters.compactSpeed(snap.txBytesPerSec))"
-                } else {
-                    titleText = " 断网"
-                }
             }
         } else {
             titleText = ""
         }
 
+        let tipText = buildTooltip()
+        let signature = "\(symbolName)|\(tintKey)|\(titleText)|\(tipText)"
+        guard signature != lastRenderedSignature else { return }
+        lastRenderedSignature = signature
+
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [tintColor]))
+        let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "ZTE Router")?.withSymbolConfiguration(config)
+        image?.isTemplate = false
+        button.image = image
+        button.imagePosition = .imageLeading
         button.title = titleText
-        button.toolTip = buildTooltip()
+        button.toolTip = tipText
     }
 
     private func buildTooltip() -> String {
@@ -170,9 +180,12 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         guard let snap = viewModel.snapshot else {
             return "ZTE 移动路由助手 (\(profileName))\n\(watchdogStatus)\n左键打开面板 · ⌥+左键一键重连外网"
         }
+        let assessment = SignalEvaluator.assess(snapshot: snap)
+        let rsrpText = assessment.rsrp.map { " · RSRP \(Int($0.rounded())) dBm" } ?? ""
+        let sinrText = assessment.sinr.map { " · SINR \(String(format: "%.1f", $0)) dB" } ?? ""
         return """
         [\(profileName)] \(snap.connectionState.localizedLabel) · \(snap.networkType) \(snap.bandSummary)
-        ↓ \(Formatters.speedBits(snap.rxBytesPerSec))  ↑ \(Formatters.speedBits(snap.txBytesPerSec)) · 终端 \(snap.totalConnectedDevices) 台
+        信号：\(assessment.grade.rawValue) (\(assessment.score)分)\(rsrpText)\(sinrText) · 终端 \(snap.totalConnectedDevices) 台
         \(watchdogStatus)
         左键打开面板 · ⌥+左键一键重连外网 · 右键菜单
         """

@@ -2,34 +2,17 @@ import Foundation
 import SwiftUI
 import ZTERouterCore
 
+@MainActor
 enum Formatters {
-    static func speedBits(_ bytesPerSecond: Double) -> String {
-        let bits = max(0, bytesPerSecond) * 8.0
-        if bits < 1_000 {
-            return String(format: "%.0f b/s", bits)
-        } else if bits < 1_000_000 {
-            return String(format: "%.1f Kb/s", bits / 1_000.0)
-        } else {
-            return String(format: "%.2f Mb/s", bits / 1_000_000.0)
-        }
-    }
-
-    static func compactSpeed(_ bytesPerSecond: Double) -> String {
-        let bits = max(0, bytesPerSecond) * 8.0
-        if bits < 1_000 {
-            return "0K"
-        } else if bits < 1_000_000 {
-            return String(format: "%.0fK", bits / 1_000.0)
-        } else {
-            return String(format: "%.1fM", bits / 1_000_000.0)
-        }
-    }
-
-    static func byteCount(_ bytes: UInt64) -> String {
+    private static let byteFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
         formatter.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
         formatter.countStyle = .binary
-        return formatter.string(fromByteCount: Int64(clamping: bytes))
+        return formatter
+    }()
+
+    static func byteCount(_ bytes: UInt64) -> String {
+        byteFormatter.string(fromByteCount: Int64(clamping: bytes))
     }
 
     static func duration(_ totalSeconds: Int) -> String {

@@ -97,7 +97,7 @@ struct WatchdogView: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("探测端点列表（支持手动编辑域名与单端点代理）")
+                    Text("探测端点列表（支持手动编辑域名、权重与独立频率/超时）")
                         .font(.subheadline.weight(.semibold))
                     Spacer()
                     Button {
@@ -105,7 +105,9 @@ struct WatchdogView: View {
                             isEnabled: true,
                             name: "自定义站点",
                             urlString: "https://",
-                            proxyMode: .system
+                            weight: 1,
+                            intervalSec: 33,
+                            timeoutSec: 4
                         ))
                         markDirty()
                     } label: {
@@ -149,22 +151,14 @@ struct WatchdogView: View {
 
                 TextField("名称", text: endpoint.name, prompt: Text("名称"))
                     .textFieldStyle(.roundedBorder)
-                    .frame(width: 108)
+                    .frame(width: 112)
                     .onChange(of: epVal.name) { _, _ in markDirty() }
                     .onSubmit { applyDraftConfig() }
 
-                TextField("检测链接 (http/https)", text: endpoint.urlString, prompt: Text("https://661313.xyz/test/success.txt"))
+                TextField("检测链接 (http/https)", text: endpoint.urlString, prompt: Text("https://661313.xyz/test/generate_204"))
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
-                    .onChange(of: epVal.urlString) { _, newURL in
-                        let lower = newURL.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                        if lower.contains("661313.xyz/test/success.txt") {
-                            endpoint.wrappedValue.expectedResponseText = "success"
-                        } else if endpoint.wrappedValue.expectedResponseText == "success" {
-                            endpoint.wrappedValue.expectedResponseText = ""
-                        }
-                        markDirty()
-                    }
+                    .onChange(of: epVal.urlString) { _, _ in markDirty() }
                     .onSubmit { applyDraftConfig() }
 
                 Picker("", selection: endpoint.weight) {
@@ -174,17 +168,8 @@ struct WatchdogView: View {
                 }
                 .labelsHidden()
                 .frame(width: 78)
-                .help("端点权重（1–10）。选择按权重判定时，可达权重之和须超过总权重 50%")
+                .help("端点权重（1–10）。按权重判定时，可达权重之和须超过总权重 50%")
                 .onChange(of: epVal.weight) { _, _ in applyDraftConfig() }
-
-                Picker("", selection: endpoint.proxyMode) {
-                    ForEach(EndpointProxyMode.allCases) { mode in
-                        Text(mode.shortName).tag(mode)
-                    }
-                }
-                .labelsHidden()
-                .frame(width: 92)
-                .onChange(of: epVal.proxyMode) { _, _ in applyDraftConfig() }
 
                 outcomeBadge(outcome)
 
@@ -198,37 +183,31 @@ struct WatchdogView: View {
                 .help("删除此端点")
             }
 
-            if epVal.proxyMode == .http || epVal.proxyMode == .socks5 {
-                HStack(spacing: 8) {
-                    Text("代理服务器:")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.leading, 26)
-                    TextField("主机 (如 127.0.0.1)", text: endpoint.proxyHost)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 130)
-                        .onChange(of: epVal.proxyHost) { _, _ in markDirty() }
-                        .onSubmit { applyDraftConfig() }
-                    TextField("端口", value: endpoint.proxyPort, format: .number)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 70)
-                        .onChange(of: epVal.proxyPort) { _, _ in markDirty() }
-                        .onSubmit { applyDraftConfig() }
-                    TextField("用户名(可选)", text: endpoint.proxyUsername)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 100)
-                        .onChange(of: epVal.proxyUsername) { _, _ in markDirty() }
-                        .onSubmit { applyDraftConfig() }
-                    SecureField("密码(可选)", text: endpoint.proxyPassword)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 100)
-                        .onChange(of: epVal.proxyPassword) { _, _ in markDirty() }
-                        .onSubmit { applyDraftConfig() }
-                }
+            HStack(spacing: 18) {
+                inlineNumberInput("检测频率 (s)", value: endpoint.intervalSec, range: 5...3600)
+                inlineNumberInput("单次超时 (s)", value: endpoint.timeoutSec, range: 1...30)
+                Spacer()
             }
+            .padding(.leading, 28)
         }
         .padding(8)
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func inlineNumberInput(_ title: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {
+        HStack(spacing: 6) {
+            Text(title + ":")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField("", value: value, format: .number)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 56)
+                .onChange(of: value.wrappedValue) { _, _ in markDirty() }
+                .onSubmit { applyDraftConfig() }
+            Stepper("", value: value, in: range)
+                .labelsHidden()
+                .onChange(of: value.wrappedValue) { _, _ in markDirty() }
+        }
     }
 
     @ViewBuilder
@@ -301,20 +280,16 @@ struct WatchdogView: View {
 
                 Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 8) {
                     GridRow {
-                        numberInput("单次探测超时 (ms)", value: $draftConfig.checkTimeoutMs, range: 500...30000)
-                        numberInput("正常轮询间隔 (秒)", value: $draftConfig.pollIntervalSec, range: 5...3600)
-                    }
-                    GridRow {
                         numberInput("重连前防抖复检 (次)", value: $draftConfig.recheckBeforeAct, range: 0...10)
-                        numberInput("复检及重连后间隔 (秒)", value: $draftConfig.recheckIntervalSec, range: 1...60)
+                        numberInput("复检及重连后间隔 (s)", value: $draftConfig.recheckIntervalSec, range: 1...60)
                     }
                     GridRow {
                         numberInput("连续重连上限 (次)", value: $draftConfig.maxConsecutiveReconnects, range: 1...10)
-                        numberInput("触发上限后冷却 (秒)", value: $draftConfig.cooldownSec, range: 10...600)
+                        numberInput("触发上限后冷却 (s)", value: $draftConfig.cooldownSec, range: 10...600)
                     }
                 }
 
-                Text("触发节奏：首轮检测异常后间隔 \(draftConfig.recheckIntervalSec)s 再复检 \(draftConfig.recheckBeforeAct) 次，即连续 \(draftConfig.recheckBeforeAct + 1) 次不通立刻触发重连。")
+                Text("触发节奏：各端点按自身频率(s)与超时(s)独立检测；首轮判为异常后间隔 \(draftConfig.recheckIntervalSec)s 再复检 \(draftConfig.recheckBeforeAct) 次，即连续 \(draftConfig.recheckBeforeAct + 1) 次不通立刻触发重连。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 

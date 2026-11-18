@@ -4,16 +4,16 @@ import ZTERouterCore
 
 public enum MenuBarDisplayStyle: String, CaseIterable, Codable, Sendable, Identifiable {
     case iconOnly
+    case iconAndSignal
     case iconAndBand
-    case iconAndSpeed
 
     public var id: String { rawValue }
 
     public var displayName: String {
         switch self {
         case .iconOnly: "仅图标"
+        case .iconAndSignal: "图标 + 信号强度"
         case .iconAndBand: "图标 + 制式/频段"
-        case .iconAndSpeed: "图标 + 实时网速"
         }
     }
 }
@@ -31,12 +31,9 @@ final class SettingsStore {
         static let systemNotificationsEnabled = "zte.router.systemNotificationsEnabled"
         static let watchdogConfig = "zte.router.watchdogConfig.v1"
         static let watchdogDefaultsVersion = "zte.router.watchdogDefaultsVersion"
-        // Legacy single-profile keys for migration
-        static let legacyRouterURL = "zte.router.url"
-        static let legacyHashPreference = "zte.router.hashPreference"
     }
 
-    private static let currentWatchdogDefaultsVersion = 3
+    private static let currentWatchdogDefaultsVersion = 4
 
     var profiles: [RouterProfile] {
         didSet { saveProfiles() }
@@ -71,7 +68,7 @@ final class SettingsStore {
     }
 
     var menuBarDisplayStyle: MenuBarDisplayStyle {
-        get { MenuBarDisplayStyle(rawValue: menuBarDisplayStyleRaw) ?? .iconAndBand }
+        get { MenuBarDisplayStyle(rawValue: menuBarDisplayStyleRaw) ?? .iconAndSignal }
         set { menuBarDisplayStyleRaw = newValue.rawValue }
     }
 
@@ -84,28 +81,22 @@ final class SettingsStore {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
 
-        var loadedProfiles: [RouterProfile] = []
+        let loadedProfiles: [RouterProfile]
         if let data = defaults.data(forKey: Keys.profiles),
            let decoded = try? JSONDecoder().decode([RouterProfile].self, from: data),
            !decoded.isEmpty {
             loadedProfiles = decoded
         } else {
-            let legacyURL = defaults.string(forKey: Keys.legacyRouterURL) ?? "http://192.168.8.1"
-            let legacyHash = AuthHashPreference(rawValue: defaults.string(forKey: Keys.legacyHashPreference) ?? "") ?? .auto
-            let defaultProfile = RouterProfile(
-                id: UUID(),
-                name: "默认路由器",
-                routerURLString: legacyURL,
-                wifiSSIDs: [],
-                hashPreference: legacyHash
-            )
-            loadedProfiles = [defaultProfile]
-            if let oldPassword = KeychainPasswordStore.loadLegacyPassword(for: legacyURL), !oldPassword.isEmpty {
-                KeychainPasswordStore.savePassword(oldPassword, forProfileID: defaultProfile.id)
-            }
+            loadedProfiles = [
+                RouterProfile(
+                    id: UUID(),
+                    name: "默认路由器",
+                    routerURLString: "http://192.168.8.1"
+                )
+            ]
         }
-
         self.profiles = loadedProfiles
+
         if let savedIDString = defaults.string(forKey: Keys.activeProfileID),
            let savedID = UUID(uuidString: savedIDString),
            loadedProfiles.contains(where: { $0.id == savedID }) {
@@ -117,25 +108,32 @@ final class SettingsStore {
         self.autoMatchByWiFi = defaults.object(forKey: Keys.autoMatchByWiFi) as? Bool ?? true
         let savedInterval = defaults.double(forKey: Keys.pollingInterval)
         self.pollingInterval = savedInterval > 0 ? savedInterval : 3.0
-        self.menuBarDisplayStyleRaw = defaults.string(forKey: Keys.menuBarDisplayStyle) ?? MenuBarDisplayStyle.iconAndBand.rawValue
+
+        let storedStyleRaw = defaults.string(forKey: Keys.menuBarDisplayStyle) ?? ""
+        if let validStyle = MenuBarDisplayStyle(rawValue: storedStyleRaw) {
+            self.menuBarDisplayStyleRaw = validStyle.rawValue
+        } else {
+            // Migrate retired `iconAndSpeed` or missing style to signal strength.
+            self.menuBarDisplayStyleRaw = MenuBarDisplayStyle.iconAndSignal.rawValue
+        }
+
         self.globalShortcutEnabled = defaults.object(forKey: Keys.globalShortcutEnabled) as? Bool ?? true
         self.systemNotificationsEnabled = defaults.object(forKey: Keys.systemNotificationsEnabled) as? Bool ?? true
 
+        let savedVersion = defaults.integer(forKey: Keys.watchdogDefaultsVersion)
         if let wdData = defaults.data(forKey: Keys.watchdogConfig),
-           var decodedWD = try? JSONDecoder().decode(WatchdogConfig.self, from: wdData) {
-            for idx in decodedWD.endpoints.indices {
-                let id = decodedWD.endpoints[idx].id
-                if let proxyPass = KeychainPasswordStore.loadProxyPassword(forEndpointID: id) {
-                    decodedWD.endpoints[idx].proxyPassword = proxyPass
-                }
-            }
-            let savedVersion = defaults.integer(forKey: Keys.watchdogDefaultsVersion)
-            if savedVersion < Self.currentWatchdogDefaultsVersion {
-                decodedWD = decodedWD.migratingLegacyDefaults(fromVersion: savedVersion)
-            }
-            self.watchdogConfig = decodedWD.clamped()
+           let decodedWD = try? JSONDecoder().decode(WatchdogConfig.self, from: wdData) {
+            self.watchdogConfig = savedVersion < Self.currentWatchdogDefaultsVersion
+                ? decodedWD.migratingLegacyDefaults(fromVersion: savedVersion)
+                : decodedWD.clamped()
         } else {
             self.watchdogConfig = WatchdogConfig()
+        }
+
+        if savedVersion < Self.currentWatchdogDefaultsVersion {
+            KeychainPasswordStore.purgeRetiredProxyPasswords()
+            defaults.removeObject(forKey: "zte.router.url")
+            defaults.removeObject(forKey: "zte.router.hashPreference")
         }
 
         defaults.set(Self.currentWatchdogDefaultsVersion, forKey: Keys.watchdogDefaultsVersion)
@@ -185,18 +183,7 @@ final class SettingsStore {
     }
 
     private func saveWatchdogConfig() {
-        // Store optional proxy passwords in Keychain rather than UserDefaults plist.
-        var sanitized = watchdogConfig.clamped()
-        for idx in sanitized.endpoints.indices {
-            let ep = sanitized.endpoints[idx]
-            if ep.proxyPassword.isEmpty {
-                KeychainPasswordStore.deleteProxyPassword(forEndpointID: ep.id)
-            } else {
-                KeychainPasswordStore.saveProxyPassword(ep.proxyPassword, forEndpointID: ep.id)
-            }
-            sanitized.endpoints[idx].proxyPassword = ""
-        }
-        if let encoded = try? JSONEncoder().encode(sanitized) {
+        if let encoded = try? JSONEncoder().encode(watchdogConfig.clamped()) {
             defaults.set(encoded, forKey: Keys.watchdogConfig)
         }
     }
@@ -204,8 +191,7 @@ final class SettingsStore {
 
 enum KeychainPasswordStore {
     private static let profileService = "com.zte.routerbar.profile"
-    private static let proxyService = "com.zte.routerbar.watchdogProxy"
-    private static let legacyService = "com.zte.routerbar.admin"
+    private static let retiredProxyService = "com.zte.routerbar.watchdogProxy"
 
     static func loadPassword(forProfileID id: UUID) -> String? {
         load(service: profileService, account: id.uuidString)
@@ -221,23 +207,12 @@ enum KeychainPasswordStore {
         delete(service: profileService, account: id.uuidString)
     }
 
-    static func loadProxyPassword(forEndpointID id: UUID) -> String? {
-        load(service: proxyService, account: id.uuidString)
-    }
-
-    @discardableResult
-    static func saveProxyPassword(_ password: String, forEndpointID id: UUID) -> OSStatus {
-        save(password, service: proxyService, account: id.uuidString)
-    }
-
-    @discardableResult
-    static func deleteProxyPassword(forEndpointID id: UUID) -> OSStatus {
-        delete(service: proxyService, account: id.uuidString)
-    }
-
-    static func loadLegacyPassword(for hostKey: String) -> String? {
-        let account = hostKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return load(service: legacyService, account: account.isEmpty ? "default" : account)
+    static func purgeRetiredProxyPasswords() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: retiredProxyService
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 
     private static func load(service: String, account: String) -> String? {
