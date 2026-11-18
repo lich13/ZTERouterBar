@@ -41,19 +41,27 @@ final class SystemNotificationManager: NSObject, UserNotificationSending, @preco
             center.delegate = self
             didConfigureDelegate = true
         }
-        let settings = await center.notificationSettings()
-        authorizationStatus = settings.authorizationStatus
-        if settings.authorizationStatus == .notDetermined {
+        let status = await Self.fetchAuthorizationStatus()
+        authorizationStatus = status
+        if status == .notDetermined {
             _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
-            let updated = await center.notificationSettings()
-            authorizationStatus = updated.authorizationStatus
+            authorizationStatus = await Self.fetchAuthorizationStatus()
         }
     }
 
     func refreshAuthorizationStatus() async {
         guard canUseCenter else { return }
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        authorizationStatus = settings.authorizationStatus
+        authorizationStatus = await Self.fetchAuthorizationStatus()
+    }
+
+    /// Reads `authorizationStatus` inside the callback so non-`Sendable` `UNNotificationSettings`
+    /// never crosses concurrency domains on Xcode 16 / macOS 15 SDKs.
+    private nonisolated static func fetchAuthorizationStatus() async -> UNAuthorizationStatus {
+        await withCheckedContinuation { continuation in
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                continuation.resume(returning: settings.authorizationStatus)
+            }
+        }
     }
 
     func openSystemNotificationSettings() {
