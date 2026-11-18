@@ -248,10 +248,13 @@ struct WatchdogView: View {
                 Toggle("打开 App 后自动启动外网保活守护", isOn: $draftConfig.autoStart)
                     .onChange(of: draftConfig.autoStart) { _, _ in applyDraftConfig() }
 
+                Toggle("外网持续异常时自动重连（关闭则仅推送通知）", isOn: $draftConfig.autoReconnectEnabled)
+                    .onChange(of: draftConfig.autoReconnectEnabled) { _, _ in applyDraftConfig() }
+
                 Toggle("仅在当前连接的 Wi-Fi 已匹配当前路由器配置时自动重连", isOn: $draftConfig.onlyWhenWiFiMatched)
                     .onChange(of: draftConfig.onlyWhenWiFiMatched) { _, _ in applyDraftConfig() }
 
-                Toggle("自动重连与重连前后 IP 变化时推送 macOS 系统通知（含手动重连）", isOn: Bindable(viewModel.settings).systemNotificationsEnabled)
+                Toggle("探测不通、自动重连与重连前后 IP 变化时推送 macOS 系统通知（含手动重连）", isOn: Bindable(viewModel.settings).systemNotificationsEnabled)
 
                 if viewModel.settings.systemNotificationsEnabled && viewModel.notifier.authorizationStatus == .denied {
                     HStack(spacing: 8) {
@@ -292,7 +295,10 @@ struct WatchdogView: View {
                     }
                 }
 
-                Text("触发节奏：各端点按自身频率(s)与超时(s)独立检测；判为异常后每 \(draftConfig.recheckIntervalSec)s 对全部端点复检，任一轮恢复即取消，持续异常满 \(draftConfig.failureWindowSec)s 才重连。重连后 \(draftConfig.postReconnectGraceSec)s 保护期内不探测、不重连，之后从头监测。")
+                Text("触发节奏：各端点按自身频率(s)与超时(s)独立检测；判为异常后每 \(draftConfig.recheckIntervalSec)s 对全部端点复检，连续 2 次不通先推送通知，任一轮恢复即取消。"
+                    + (draftConfig.autoReconnectEnabled
+                        ? "持续异常满 \(draftConfig.failureWindowSec)s 才重连，重连后 \(draftConfig.postReconnectGraceSec)s 保护期内不探测、不重连，之后从头监测。"
+                        : "自动重连未开启：只通知、不重连，下方重连参数暂不生效。"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
 

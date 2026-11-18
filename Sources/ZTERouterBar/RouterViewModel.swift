@@ -313,6 +313,14 @@ final class RouterViewModel {
         case let .probeRoundCompleted(outcomes, overallHealthy):
             lastProbeOutcomes = outcomes
             lastWatchdogHealthy = overallHealthy
+        case let .probeFailureDetected(reason):
+            if settings.systemNotificationsEnabled {
+                notifier.notifyProbeFailure(
+                    profileName: activeProfile.name,
+                    reason: reason,
+                    willAutoReconnect: settings.watchdogConfig.autoReconnectEnabled
+                )
+            }
         case let .autoReconnectTriggered(reason):
             handledAutoReconnectFinish = false
             pendingAutoBeforeIP = WANIPSnapshot(snapshot: snapshot)

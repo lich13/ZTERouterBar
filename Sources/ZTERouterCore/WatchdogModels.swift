@@ -139,13 +139,28 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
                 weight: 1,
                 intervalSec: 33,
                 timeoutSec: 4
-            )
+            ),
+            telegramPreset
         ]
+    }
+
+    /// Added in defaults version 6; appended to untouched older preset lists on upgrade.
+    public static var telegramPreset: WatchdogEndpoint {
+        WatchdogEndpoint(
+            isEnabled: true,
+            name: "Telegram API",
+            urlString: "https://api.telegram.org/",
+            weight: 1,
+            intervalSec: 33,
+            timeoutSec: 4
+        )
     }
 }
 
 public struct WatchdogConfig: Codable, Equatable, Sendable {
     public var autoStart: Bool
+    /// When off, a sustained failure only notifies; the router is never redialed automatically.
+    public var autoReconnectEnabled: Bool
     /// Seconds of continuous failure (confirmed by full re-probes) required before a reconnect.
     public var failureWindowSec: Int
     /// Interval between full re-probes while confirming a failure.
@@ -158,20 +173,21 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
     public var onlyWhenWiFiMatched: Bool
     public var endpoints: [WatchdogEndpoint]
 
-    public static let defaultFailureWindowSec = 30
+    public static let defaultFailureWindowSec = 60
     public static let defaultRecheckIntervalSec = 5
-    public static let defaultPostReconnectGraceSec = 45
+    public static let defaultPostReconnectGraceSec = 300
     public static let defaultMaxConsecutiveReconnects = 3
     public static let defaultCooldownSec = 300
 
     enum CodingKeys: String, CodingKey {
-        case autoStart, failureWindowSec, recheckIntervalSec, postReconnectGraceSec, maxConsecutiveReconnects, cooldownSec, triggerPolicy, onlyWhenWiFiMatched, endpoints
+        case autoStart, autoReconnectEnabled, failureWindowSec, recheckIntervalSec, postReconnectGraceSec, maxConsecutiveReconnects, cooldownSec, triggerPolicy, onlyWhenWiFiMatched, endpoints
         // Legacy keys decoded only when upgrading older persisted configs that lack per-endpoint timing.
         case checkTimeoutMs, pollIntervalSec
     }
 
     public init(
         autoStart: Bool = true,
+        autoReconnectEnabled: Bool = false,
         failureWindowSec: Int = WatchdogConfig.defaultFailureWindowSec,
         recheckIntervalSec: Int = WatchdogConfig.defaultRecheckIntervalSec,
         postReconnectGraceSec: Int = WatchdogConfig.defaultPostReconnectGraceSec,
@@ -182,6 +198,7 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
         endpoints: [WatchdogEndpoint] = WatchdogEndpoint.defaultPresets
     ) {
         self.autoStart = autoStart
+        self.autoReconnectEnabled = autoReconnectEnabled
         self.failureWindowSec = failureWindowSec
         self.recheckIntervalSec = recheckIntervalSec
         self.postReconnectGraceSec = postReconnectGraceSec
@@ -195,6 +212,7 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         autoStart = try container.decodeIfPresent(Bool.self, forKey: .autoStart) ?? true
+        autoReconnectEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoReconnectEnabled) ?? false
         failureWindowSec = try container.decodeIfPresent(Int.self, forKey: .failureWindowSec) ?? Self.defaultFailureWindowSec
         recheckIntervalSec = try container.decodeIfPresent(Int.self, forKey: .recheckIntervalSec) ?? Self.defaultRecheckIntervalSec
         postReconnectGraceSec = try container.decodeIfPresent(Int.self, forKey: .postReconnectGraceSec) ?? Self.defaultPostReconnectGraceSec
@@ -218,6 +236,7 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(autoStart, forKey: .autoStart)
+        try container.encode(autoReconnectEnabled, forKey: .autoReconnectEnabled)
         try container.encode(failureWindowSec, forKey: .failureWindowSec)
         try container.encode(recheckIntervalSec, forKey: .recheckIntervalSec)
         try container.encode(postReconnectGraceSec, forKey: .postReconnectGraceSec)
@@ -247,9 +266,10 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
 
     /// One-time migration of persisted configs. Versions below 4 predate per-endpoint seconds and
     /// `/test/generate_204`; versions below 5 predate the sustained-failure window and still carry
-    /// the old hair-trigger defaults (661313 weight 3, 3s recheck, 60s cooldown).
+    /// the old hair-trigger defaults (661313 weight 3, 3s recheck, 60s cooldown); versions below 6
+    /// predate the 60s window / 300s grace defaults and the Telegram preset.
     public func migratingLegacyDefaults(fromVersion version: Int) -> WatchdogConfig {
-        guard version < 5 else { return clamped() }
+        guard version < 6 else { return clamped() }
         var copy = self
         if version < 4 {
             let currentURLs = copy.endpoints.map(\.urlString)
@@ -272,15 +292,27 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
         if version < 3, copy.triggerPolicy == .allUnreachable {
             copy.triggerPolicy = .weighted
         }
-        for idx in copy.endpoints.indices
-        where copy.endpoints[idx].urlString.contains("661313.xyz/test/generate_204") && copy.endpoints[idx].weight == 3 {
-            copy.endpoints[idx].weight = 1
+        if version < 5 {
+            for idx in copy.endpoints.indices
+            where copy.endpoints[idx].urlString.contains("661313.xyz/test/generate_204") && copy.endpoints[idx].weight == 3 {
+                copy.endpoints[idx].weight = 1
+            }
+            if copy.recheckIntervalSec == 3 {
+                copy.recheckIntervalSec = WatchdogConfig.defaultRecheckIntervalSec
+            }
+            if copy.cooldownSec == 60 {
+                copy.cooldownSec = WatchdogConfig.defaultCooldownSec
+            }
         }
-        if copy.recheckIntervalSec == 3 {
-            copy.recheckIntervalSec = WatchdogConfig.defaultRecheckIntervalSec
+        if copy.failureWindowSec == 30 {
+            copy.failureWindowSec = WatchdogConfig.defaultFailureWindowSec
         }
-        if copy.cooldownSec == 60 {
-            copy.cooldownSec = WatchdogConfig.defaultCooldownSec
+        if copy.postReconnectGraceSec == 45 {
+            copy.postReconnectGraceSec = WatchdogConfig.defaultPostReconnectGraceSec
+        }
+        let presets = WatchdogEndpoint.defaultPresets
+        if copy.endpoints.map(\.urlString) == presets.dropLast().map(\.urlString) {
+            copy.endpoints.append(WatchdogEndpoint.telegramPreset)
         }
         return copy.clamped()
     }
@@ -383,6 +415,8 @@ public struct WatchdogLogEntry: Identifiable, Equatable, Sendable {
 public enum WatchdogEvent: Sendable {
     case phaseChanged(WatchdogPhase)
     case probeRoundCompleted([EndpointProbeOutcome], overallHealthy: Bool)
+    /// Second consecutive failing round of an outage; emitted once until the link is healthy again.
+    case probeFailureDetected(reason: String)
     case autoReconnectTriggered(reason: String)
     case autoReconnectFinished(state: WANConnectionState)
     case log(WatchdogLogEntry)

@@ -90,11 +90,14 @@ public struct WatchdogRunner: Sendable {
         let summaryDesc = endpoints.map { "\($0.displayTitle)(\($0.intervalSec)s/\($0.timeoutSec)s)" }.joined(separator: "、")
         await onEvent(.log(WatchdogLogEntry(
             level: .info,
-            message: "保活守护启动：\(summaryDesc)，持续异常 \(config.failureWindowSec)s 才重连（确认期每 \(config.recheckIntervalSec)s 复检），重连后保护 \(config.postReconnectGraceSec)s"
+            message: config.autoReconnectEnabled
+                ? "保活守护启动：\(summaryDesc)，持续异常 \(config.failureWindowSec)s 才重连（确认期每 \(config.recheckIntervalSec)s 复检），重连后保护 \(config.postReconnectGraceSec)s"
+                : "保活守护启动：\(summaryDesc)，自动重连未开启，连续 2 次探测不通仅通知"
         )))
         await onEvent(.phaseChanged(.monitoring))
 
         var consecutiveReconnects = 0
+        var notifiedThisOutage = false
         var latestByID: [UUID: EndpointProbeOutcome] = [:]
         var nextDueSec: [UUID: Int] = Dictionary(uniqueKeysWithValues: endpoints.map { ($0.id, 0) })
         var timelineSec = 0
@@ -118,6 +121,7 @@ public struct WatchdogRunner: Sendable {
                 await logRound(snapshotOutcomes: latest, probedOutcomes: batch, policy: config.triggerPolicy, healthy: healthy, onEvent: onEvent)
                 if healthy {
                     consecutiveReconnects = 0
+                    notifiedThisOutage = false
                     await onEvent(.phaseChanged(.monitoring))
                     continue
                 }
@@ -125,7 +129,8 @@ public struct WatchdogRunner: Sendable {
                 // Confirming: every round re-probes all endpoints; one healthy round cancels the reconnect.
                 await onEvent(.log(WatchdogLogEntry(
                     level: .warning,
-                    message: "探测异常，进入确认期：持续异常满 \(config.failureWindowSec)s 才重连（每 \(config.recheckIntervalSec)s 复检）"
+                    message: "探测异常，进入确认期：每 \(config.recheckIntervalSec)s 复检，"
+                        + (config.autoReconnectEnabled ? "持续异常满 \(config.failureWindowSec)s 才重连" : "自动重连未开启，仅通知")
                 )))
                 var failingSec = 0
                 var recovered = false
@@ -141,13 +146,25 @@ public struct WatchdogRunner: Sendable {
                     recovered = WatchdogEvaluator.isHealthy(outcomes: recheck, policy: config.triggerPolicy)
                     await logRound(snapshotOutcomes: recheck, probedOutcomes: recheck, policy: config.triggerPolicy, healthy: recovered, onEvent: onEvent)
                     if recovered { break }
+                    if !notifiedThisOutage {
+                        notifiedThisOutage = true
+                        await onEvent(.probeFailureDetected(reason: "连续 2 次探测不通"))
+                    }
                     // A round lasts its recheck pause plus its slowest probe (probes run in parallel).
                     failingSec += config.recheckIntervalSec + (recheck.map(\.elapsedMs).max() ?? 0) / 1000
                 }
                 if recovered {
                     consecutiveReconnects = 0
+                    notifiedThisOutage = false
                     await onEvent(.log(WatchdogLogEntry(level: .success, message: "确认期内恢复通畅，判定为瞬时抖动，不重连")))
                     await onEvent(.phaseChanged(.monitoring))
+                    continue
+                }
+
+                guard config.autoReconnectEnabled else {
+                    await onEvent(.phaseChanged(.paused(reason: "外网持续异常，自动重连未开启")))
+                    await onEvent(.log(WatchdogLogEntry(level: .warning, message: "持续 \(failingSec)s 检测不可达；自动重连未开启，仅通知，继续监测")))
+                    try await pause(seconds: endpoints.map(\.intervalSec).min() ?? 15, endpoints: endpoints, nextDueSec: &nextDueSec, timelineSec: &timelineSec)
                     continue
                 }
 

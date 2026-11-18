@@ -8,6 +8,7 @@ protocol UserNotificationSending: AnyObject {
     var authorizationStatus: UNAuthorizationStatus { get }
     func configureAndRequestAuthorization() async
     func refreshAuthorizationStatus() async
+    func notifyProbeFailure(profileName: String, reason: String, willAutoReconnect: Bool)
     func notifyAutoReconnectTriggered(profileName: String, reason: String, currentIP: WANIPSnapshot)
     func notifyReconnectIPChange(
         isAutomatic: Bool,
@@ -68,6 +69,15 @@ final class SystemNotificationManager: NSObject, UserNotificationSending, @preco
         if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    func notifyProbeFailure(profileName: String, reason: String, willAutoReconnect: Bool) {
+        let followUp = willAutoReconnect ? "持续异常将自动重连。" : "自动重连未开启，可手动重连。"
+        deliver(
+            identifierPrefix: "zte.probe.fail",
+            title: "ZTERouterBar · 外网探测不通",
+            body: "路由器「\(profileName)」\(reason)。\(followUp)"
+        )
     }
 
     func notifyAutoReconnectTriggered(profileName: String, reason: String, currentIP: WANIPSnapshot) {

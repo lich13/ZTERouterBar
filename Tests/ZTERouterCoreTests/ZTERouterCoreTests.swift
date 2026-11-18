@@ -295,13 +295,18 @@ struct ZTERouterCoreTests {
     func testWatchdogConfigAndPolicies() throws {
         let cfg = WatchdogConfig()
         #expect(cfg.autoStart == true)
+        #expect(cfg.autoReconnectEnabled == false)
         #expect(cfg.triggerPolicy == .weighted)
-        #expect(cfg.failureWindowSec == 30)
+        #expect(cfg.failureWindowSec == 60)
         #expect(cfg.recheckIntervalSec == 5)
-        #expect(cfg.postReconnectGraceSec == 45)
+        #expect(cfg.postReconnectGraceSec == 300)
         #expect(cfg.maxConsecutiveReconnects == 3)
         #expect(cfg.cooldownSec == 300)
-        #expect(cfg.endpoints.count == 3)
+        #expect(cfg.endpoints.count == 4)
+        #expect(cfg.endpoints[3].urlString == "https://api.telegram.org/")
+        #expect(cfg.endpoints[3].weight == 1)
+        #expect(cfg.endpoints[3].intervalSec == 33)
+        #expect(cfg.endpoints[3].timeoutSec == 4)
         #expect(cfg.endpoints[0].urlString == "https://661313.xyz/test/generate_204")
         #expect(cfg.endpoints[0].weight == 1)
         #expect(cfg.endpoints[0].intervalSec == 15)
@@ -345,8 +350,9 @@ struct ZTERouterCoreTests {
         #expect(migrated104.endpoints[0].weight == 1)
         #expect(migrated104.recheckIntervalSec == 5)
         #expect(migrated104.cooldownSec == 300)
-        #expect(migrated104.failureWindowSec == 30)
-        #expect(migrated104.postReconnectGraceSec == 45)
+        #expect(migrated104.failureWindowSec == 60)
+        #expect(migrated104.postReconnectGraceSec == 300)
+        #expect(migrated104.autoReconnectEnabled == false)
 
         // v1.0.5 (defaults version 4) config with user-tuned timeouts: only the hair-trigger defaults change.
         let v105JSON = Data("""
@@ -371,13 +377,31 @@ struct ZTERouterCoreTests {
         #expect(migrated105.endpoints.map(\.intervalSec) == [15, 33, 20])
         #expect(migrated105.recheckIntervalSec == 5)
         #expect(migrated105.cooldownSec == 300)
-        #expect(migrated105.failureWindowSec == 30)
-        #expect(migrated105.postReconnectGraceSec == 45)
+        #expect(migrated105.failureWindowSec == 60)
+        #expect(migrated105.postReconnectGraceSec == 300)
+        #expect(migrated105.endpoints.count == 3)
         // Already-migrated configs keep whatever the user chose afterwards.
         var tuned = migrated105
         tuned.recheckIntervalSec = 3
         tuned.cooldownSec = 60
-        #expect(tuned.migratingLegacyDefaults(fromVersion: 5) == tuned)
+        #expect(tuned.migratingLegacyDefaults(fromVersion: 6) == tuned)
+
+        // v1.1.0 (defaults version 5): untouched 30s/45s defaults and the 3-preset list move to the
+        // new defaults; values the user tuned and custom endpoint lists stay as they are.
+        let v110 = WatchdogConfig(
+            failureWindowSec: 30,
+            postReconnectGraceSec: 45,
+            endpoints: Array(WatchdogEndpoint.defaultPresets.dropLast())
+        ).migratingLegacyDefaults(fromVersion: 5)
+        #expect(v110.failureWindowSec == 60)
+        #expect(v110.postReconnectGraceSec == 300)
+        #expect(v110.endpoints.map(\.urlString) == WatchdogEndpoint.defaultPresets.map(\.urlString))
+        let v110Tuned = WatchdogConfig(
+            failureWindowSec: 40,
+            postReconnectGraceSec: 90,
+            endpoints: [WatchdogEndpoint(name: "Custom", urlString: "https://custom.invalid/ping")]
+        )
+        #expect(v110Tuned.migratingLegacyDefaults(fromVersion: 5) == v110Tuned)
 
         // Legacy untouched preset sets migrate cleanly to v1.1.0 defaults
         for oldURLs in WatchdogEndpoint.legacyPresetURLSets {
@@ -461,17 +485,44 @@ struct ZTERouterCoreTests {
 
         #expect(await router.reconnectCount == 0)
         let phases = await collector.phases
-        #expect(phases.contains(.confirming(elapsedSec: 0, windowSec: 30)))
-        #expect(phases.contains(.confirming(elapsedSec: 5, windowSec: 30)))
+        #expect(phases.contains(.confirming(elapsedSec: 0, windowSec: 60)))
+        #expect(phases.contains(.confirming(elapsedSec: 5, windowSec: 60)))
+        #expect(!phases.contains(.reconnecting))
+        #expect(await collector.probeFailureCount == 1)
+    }
+
+    @Test("With auto reconnect off, a sustained failure notifies once and never redials")
+    func testWatchdogAutoReconnectDisabledOnlyNotifies() async {
+        // 1 failing round + 12 failing rechecks fill the window, then the outage simply continues.
+        let prober = ScriptedProber(roundResults: Array(repeating: false, count: 40))
+        let router = MockReconnectRouter()
+        var cfg = WatchdogConfig()
+        cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid")]
+
+        let collector = PhaseCollector()
+        let task = Task {
+            await WatchdogRunner(sleep: Self.fastSleep).run(config: cfg, prober: prober, router: router) { event in
+                await collector.record(event)
+            }
+        }
+        await Self.waitUntil { await prober.completedRounds >= 20 }
+        task.cancel()
+        await task.value
+
+        #expect(await router.reconnectCount == 0)
+        #expect(await collector.autoTriggerCount == 0)
+        #expect(await collector.probeFailureCount == 1)
+        let phases = await collector.phases
+        #expect(phases.contains(.paused(reason: "外网持续异常，自动重连未开启")))
         #expect(!phases.contains(.reconnecting))
     }
 
     @Test("Watchdog reconnects once after a full failure window, then stays silent for the grace period")
     func testWatchdogSustainedFailureReconnectsOnceThenSettles() async {
-        // 1 failing round + 6 failing rechecks (6 x 5s = 30s window) -> reconnect -> recovered afterwards.
-        let prober = ScriptedProber(roundResults: Array(repeating: false, count: 7))
+        // 1 failing round + 12 failing rechecks (12 x 5s = 60s window) -> reconnect -> recovered afterwards.
+        let prober = ScriptedProber(roundResults: Array(repeating: false, count: 13))
         let router = MockReconnectRouter()
-        var cfg = WatchdogConfig()
+        var cfg = WatchdogConfig(autoReconnectEnabled: true)
         cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid")]
 
         let collector = PhaseCollector()
@@ -485,33 +536,34 @@ struct ZTERouterCoreTests {
                 await collector.record(event)
             }
         }
-        await Self.waitUntil { await prober.completedRounds >= 10 }
+        await Self.waitUntil { await prober.completedRounds >= 16 }
         task.cancel()
         await task.value
 
         #expect(await router.reconnectCount == 1)
         #expect(await collector.autoTriggerCount == 1)
+        #expect(await collector.probeFailureCount == 1)
         #expect(await collector.autoFinishCount == 1)
 
         let phases = await collector.phases
         let beforeReconnect = phases.prefix { $0 != .reconnecting }
-        #expect(beforeReconnect.filter(Self.isConfirming).count == 6)
-        #expect(phases.contains(.settling(seconds: 45)))
+        #expect(beforeReconnect.filter(Self.isConfirming).count == 12)
+        #expect(phases.contains(.settling(seconds: 300)))
         #expect(!phases.contains(.coolingDown(seconds: 300)))
 
         // The grace period is one uninterrupted sleep: no probe happens inside it.
         let recorded = await sleeps.durations
-        #expect(recorded.contains(.seconds(45)))
-        let graceIndex = recorded.firstIndex(of: .seconds(45))
-        #expect(graceIndex.map { recorded[..<$0].filter { $0 == .seconds(5) }.count } == 6)
+        #expect(recorded.contains(.seconds(300)))
+        let graceIndex = recorded.firstIndex(of: .seconds(300))
+        #expect(graceIndex.map { recorded[..<$0].filter { $0 == .seconds(5) }.count } == 12)
     }
 
     @Test("Slow failing probes count toward the failure window")
     func testWatchdogWindowCountsProbeDuration() async {
-        // Each failing recheck takes 10s on top of the 5s pause: 2 rechecks cover the 30s window.
-        let prober = ScriptedProber(roundResults: Array(repeating: false, count: 3), elapsedMs: 10_000)
+        // Each failing recheck takes 10s on top of the 5s pause: 4 rechecks cover the 60s window.
+        let prober = ScriptedProber(roundResults: Array(repeating: false, count: 5), elapsedMs: 10_000)
         let router = MockReconnectRouter()
-        var cfg = WatchdogConfig()
+        var cfg = WatchdogConfig(autoReconnectEnabled: true)
         cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid", timeoutSec: 10)]
 
         let collector = PhaseCollector()
@@ -520,15 +572,17 @@ struct ZTERouterCoreTests {
                 await collector.record(event)
             }
         }
-        await Self.waitUntil { await prober.completedRounds >= 5 }
+        await Self.waitUntil { await prober.completedRounds >= 7 }
         task.cancel()
         await task.value
 
         #expect(await router.reconnectCount == 1)
         let phases = await collector.phases
         #expect(phases.prefix { $0 != .reconnecting }.filter(Self.isConfirming) == [
-            .confirming(elapsedSec: 0, windowSec: 30),
-            .confirming(elapsedSec: 15, windowSec: 30)
+            .confirming(elapsedSec: 0, windowSec: 60),
+            .confirming(elapsedSec: 15, windowSec: 60),
+            .confirming(elapsedSec: 30, windowSec: 60),
+            .confirming(elapsedSec: 45, windowSec: 60)
         ])
     }
 
@@ -537,7 +591,7 @@ struct ZTERouterCoreTests {
         // window 10s / recheck 5s = 2 rechecks. Fail (1+2) -> reconnect #1 -> grace -> fail (1+2) -> reconnect #2 -> cooldown -> recovered.
         let prober = ScriptedProber(roundResults: Array(repeating: false, count: 6))
         let router = MockReconnectRouter()
-        var cfg = WatchdogConfig(failureWindowSec: 10, maxConsecutiveReconnects: 2, cooldownSec: 60)
+        var cfg = WatchdogConfig(autoReconnectEnabled: true, failureWindowSec: 10, postReconnectGraceSec: 45, maxConsecutiveReconnects: 2, cooldownSec: 60)
         cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid")]
 
         let collector = PhaseCollector()
@@ -739,9 +793,12 @@ private actor PhaseCollector {
     private(set) var phases: [WatchdogPhase] = []
     private(set) var autoTriggerCount = 0
     private(set) var autoFinishCount = 0
+    private(set) var probeFailureCount = 0
 
     func record(_ event: WatchdogEvent) {
         switch event {
+        case .probeFailureDetected:
+            probeFailureCount += 1
         case let .phaseChanged(phase):
             phases.append(phase)
         case .autoReconnectTriggered:
