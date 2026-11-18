@@ -37,7 +37,8 @@ final class SystemNotificationManager: NSObject, UserNotificationSending, @preco
 
     func configureAndRequestAuthorization() async {
         guard canUseCenter else { return }
-        let center = configuredCenter()
+        ensureDelegate()
+        let center = UNUserNotificationCenter.current()
         let status = await Self.fetchAuthorizationStatus()
         authorizationStatus = status
         if status == .notDetermined {
@@ -109,18 +110,15 @@ final class SystemNotificationManager: NSObject, UserNotificationSending, @preco
         )
     }
 
-    private func configuredCenter() -> UNUserNotificationCenter {
-        let center = UNUserNotificationCenter.current()
-        if !didConfigureDelegate {
-            center.delegate = self
-            didConfigureDelegate = true
-        }
-        return center
+    private func ensureDelegate() {
+        guard !didConfigureDelegate else { return }
+        UNUserNotificationCenter.current().delegate = self
+        didConfigureDelegate = true
     }
 
     private func deliver(identifierPrefix: String, title: String, body: String) {
         guard canUseCenter else { return }
-        let center = configuredCenter()
+        ensureDelegate()
 
         let content = UNMutableNotificationContent()
         content.title = title
@@ -132,7 +130,7 @@ final class SystemNotificationManager: NSObject, UserNotificationSending, @preco
             content: content,
             trigger: nil
         )
-        center.add(request)
+        UNUserNotificationCenter.current().add(request)
     }
 
     // Ensure banners are presented even when Dashboard/Settings window is active in foreground.
