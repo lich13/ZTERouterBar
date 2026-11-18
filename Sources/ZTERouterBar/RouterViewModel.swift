@@ -3,6 +3,22 @@ import Foundation
 import ServiceManagement
 import ZTERouterCore
 
+enum LaunchMode: String, CaseIterable, Identifiable {
+    case manual
+    case atLogin
+    case wifiOnly
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .manual: "手动启动"
+        case .atLogin: "登录 macOS 时启动"
+        case .wifiOnly: "仅连接已绑定 Wi-Fi 时启动（离开后自动退出）"
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class RouterViewModel {
@@ -32,12 +48,21 @@ final class RouterViewModel {
 
     var lastError: String?
     var actionStatusMessage: String?
-    var launchAtLoginEnabled: Bool = false
+    var launchMode: LaunchMode = .manual
 
     private var pollingTask: Task<Void, Never>?
     private var watchdogTask: Task<Void, Never>?
     private var clearMessageTask: Task<Void, Never>?
     private var userStoppedWatchdog = false
+    /// Bumped on every start/stop so a superseded watchdog task cannot touch current state.
+    private var watchdogGeneration = 0
+    private var manualReconnectGraceUntil: Date?
+    private var lastStationFetchAt: Date?
+
+    // "Launch only on bound Wi-Fi": quit after leaving a bound Wi-Fi this run was started on.
+    private var sawBoundWiFi = false
+    private var leaveQuitTask: Task<Void, Never>?
+    private var leaveQuitDeferredByUI = false
     private var pendingAutoBeforeIP: WANIPSnapshot = WANIPSnapshot()
     private var handledAutoReconnectFinish = false
 
@@ -64,7 +89,17 @@ final class RouterViewModel {
 
         reloadPasswordFromKeychain()
         rebuildClient()
-        refreshLaunchAtLoginStatus()
+
+        // Any launch that reaches the UI lifts a previous "user quit on this Wi-Fi" hold.
+        WiFiLaunchAgent.clearSuppression()
+        if settings.wifiOnlyLaunch {
+            WiFiLaunchAgent.syncIfNeeded()
+            if SMAppService.mainApp.status == .enabled {
+                try? SMAppService.mainApp.unregister()
+            }
+        }
+        refreshLaunchMode()
+        evaluateLeaveQuit()
 
         Task { [weak self] in
             await self?.notifier.configureAndRequestAuthorization()
@@ -94,7 +129,7 @@ final class RouterViewModel {
                 if self.hasStoredPassword {
                     await self.refreshNow(silent: true)
                 }
-                let baseInterval = self.isUIActive ? min(2.0, self.settings.pollingInterval) : max(3.0, self.settings.pollingInterval * 2.0)
+                let baseInterval = self.isUIActive ? min(2.0, self.settings.pollingInterval) : max(10.0, self.settings.pollingInterval * 2.0)
                 let interval = self.isSessionOccupied ? max(15.0, baseInterval * 4.0) : baseInterval
                 try? await Task.sleep(for: .seconds(interval))
             }
@@ -112,6 +147,11 @@ final class RouterViewModel {
             wifiMonitor.refreshSSID()
             if hasStoredPassword && !isSessionOccupied {
                 Task { await refreshNow(silent: true) }
+            }
+        } else if leaveQuitDeferredByUI {
+            leaveQuitDeferredByUI = false
+            if settings.wifiOnlyLaunch && matchedProfileForCurrentWiFi == nil {
+                NSApp.terminate(nil)
             }
         }
     }
@@ -135,7 +175,10 @@ final class RouterViewModel {
 
         userStoppedWatchdog = false
         watchdogTask?.cancel()
+        watchdogGeneration += 1
+        let generation = watchdogGeneration
         isWatchdogRunning = true
+        watchdogPhase = .idle
         let config = settings.watchdogConfig.clamped()
 
         watchdogTask = Task { [weak self] in
@@ -150,6 +193,9 @@ final class RouterViewModel {
                         if self.isReconnectingWAN {
                             return "正在执行手动重连，跳过本次自动重连"
                         }
+                        if let until = self.manualReconnectGraceUntil, Date() < until {
+                            return "手动重连后的保护期内，暂不自动重连"
+                        }
                         if self.settings.watchdogConfig.onlyWhenWiFiMatched {
                             guard let ssid = self.wifiMonitor.currentSSID else {
                                 return "未检测到当前 Wi-Fi 名称（已开启仅匹配 Wi-Fi 时自动重连）"
@@ -163,15 +209,17 @@ final class RouterViewModel {
                 },
                 onEvent: { [weak self] event in
                     await MainActor.run {
-                        self?.handleWatchdogEvent(event)
+                        guard let self, self.watchdogGeneration == generation else { return }
+                        self.handleWatchdogEvent(event)
                     }
                 }
             )
-            await MainActor.run {
-                self.isWatchdogRunning = false
-                self.watchdogPhase = .idle
-                self.watchdogTask = nil
-            }
+            // The runner returned on its own (e.g. no valid endpoint); a restart or stop has already
+            // moved the generation on and owns the state.
+            guard self.watchdogGeneration == generation else { return }
+            self.isWatchdogRunning = false
+            self.watchdogPhase = .idle
+            self.watchdogTask = nil
         }
     }
 
@@ -179,10 +227,15 @@ final class RouterViewModel {
         if userInitiated {
             userStoppedWatchdog = true
         }
+        let wasRunning = isWatchdogRunning
+        watchdogGeneration += 1
         watchdogTask?.cancel()
         watchdogTask = nil
         isWatchdogRunning = false
         watchdogPhase = .idle
+        if wasRunning {
+            appendWatchdogLog(WatchdogLogEntry(level: .info, message: "保活守护已停止"))
+        }
     }
 
     func toggleWatchdog() {
@@ -252,6 +305,7 @@ final class RouterViewModel {
         switch event {
         case let .phaseChanged(phase):
             let previous = watchdogPhase
+            guard previous != phase else { return }
             watchdogPhase = phase
             if previous == .reconnecting && phase != .reconnecting && !handledAutoReconnectFinish {
                 Task { await refreshNow(silent: true) }
@@ -290,6 +344,7 @@ final class RouterViewModel {
     // MARK: - Profile & Wi-Fi Auto-Matching
 
     private func handleWiFiSSIDChanged(_ ssid: String?) {
+        evaluateLeaveQuit()
         guard settings.autoMatchByWiFi else { return }
         guard let matched = RouterProfileMatcher.match(ssid: ssid, in: settings.profiles) else { return }
         guard matched.id != settings.activeProfileID else { return }
@@ -437,8 +492,8 @@ final class RouterViewModel {
                 baseURLString: profile.routerURLString,
                 hashPreference: profile.hashPreference
             )
-            let pass = KeychainPasswordStore.loadPassword(forProfileID: profile.id) ?? passwordInput
-            client = ZTERouterClient(config: config, password: pass)
+            // Every caller has just synced `passwordInput` with the keychain.
+            client = ZTERouterClient(config: config, password: passwordInput)
             lastError = nil
         } catch {
             client = nil
@@ -463,11 +518,20 @@ final class RouterViewModel {
         defer { isRefreshing = false }
 
         do {
-            let needStations = isUIActive || self.snapshot == nil
-            let fresh = try await client.fetchStatus(
+            // Station lists cost two extra requests: only while the UI is visible, and every ~10s.
+            let previous = self.snapshot
+            let stationsStale = lastStationFetchAt.map { Date().timeIntervalSince($0) >= 10 } ?? true
+            let needStations = previous == nil || (isUIActive && stationsStale)
+            var fresh = try await client.fetchStatus(
                 reclaimIfDuplicate: !silent,
                 includeStationLists: needStations
             )
+            if needStations {
+                lastStationFetchAt = Date()
+            } else if isUIActive, let previous {
+                fresh.wifiStations = previous.wifiStations
+                fresh.lanStations = previous.lanStations
+            }
             self.snapshot = fresh
             self.recordSignalSample(from: fresh)
             self.lastError = nil
@@ -496,13 +560,21 @@ final class RouterViewModel {
 
     func reconnectWAN() async {
         guard !isReconnectingWAN else { return }
+        guard watchdogPhase != .reconnecting else {
+            showToast("保活守护正在自动重连，请稍候")
+            return
+        }
         guard let client else {
             lastError = "请先配置路由器地址与密码。"
             return
         }
 
         isReconnectingWAN = true
-        defer { isReconnectingWAN = false }
+        defer {
+            isReconnectingWAN = false
+            // Give the fresh link the same quiet period an automatic reconnect gets.
+            manualReconnectGraceUntil = Date().addingTimeInterval(TimeInterval(settings.watchdogConfig.postReconnectGraceSec))
+        }
         lastError = nil
 
         var beforeIP = WANIPSnapshot(snapshot: snapshot)
@@ -584,24 +656,78 @@ final class RouterViewModel {
         await refreshNow(silent: silent)
     }
 
-    // MARK: - Launch at Login
+    // MARK: - Launch Mode
 
-    func refreshLaunchAtLoginStatus() {
-        launchAtLoginEnabled = (SMAppService.mainApp.status == .enabled)
+    var canUseWiFiOnlyLaunch: Bool {
+        wifiMonitor.isLocationAuthorized && settings.profiles.contains { !$0.wifiSSIDs.isEmpty }
     }
 
-    func setLaunchAtLogin(_ enabled: Bool) {
+    func refreshLaunchMode() {
+        if settings.wifiOnlyLaunch {
+            launchMode = .wifiOnly
+        } else {
+            launchMode = SMAppService.mainApp.status == .enabled ? .atLogin : .manual
+        }
+    }
+
+    func setLaunchMode(_ mode: LaunchMode) {
         do {
-            if enabled {
-                try SMAppService.mainApp.register()
+            if mode == .wifiOnly {
+                guard canUseWiFiOnlyLaunch else {
+                    lastError = "请先为路由器配置绑定 Wi-Fi 名称，并授权定位权限以识别当前 Wi-Fi。"
+                    return
+                }
+                try WiFiLaunchAgent.install()
+                settings.wifiOnlyLaunch = true
             } else {
+                WiFiLaunchAgent.uninstall()
+                settings.wifiOnlyLaunch = false
+            }
+            let loginItemEnabled = SMAppService.mainApp.status == .enabled
+            if mode == .atLogin, !loginItemEnabled {
+                try SMAppService.mainApp.register()
+            } else if mode != .atLogin, loginItemEnabled {
                 try SMAppService.mainApp.unregister()
             }
-            refreshLaunchAtLoginStatus()
             lastError = nil
         } catch {
-            refreshLaunchAtLoginStatus()
-            lastError = "设置开机自启失败（请确保通过 .app 应用包运行）：\(error.localizedDescription)"
+            lastError = "设置启动方式失败（请确保通过 .app 应用包运行）：\(error.localizedDescription)"
+        }
+        refreshLaunchMode()
+        evaluateLeaveQuit()
+    }
+
+    /// Called by the explicit Quit actions: on a bound Wi-Fi the launch trigger must not bring the app back.
+    func noteUserQuit() {
+        guard settings.wifiOnlyLaunch, let ssid = wifiMonitor.currentSSID, matchedProfileForCurrentWiFi != nil else { return }
+        WiFiLaunchAgent.suppressLaunch(onSSID: ssid)
+    }
+
+    /// In Wi-Fi-only mode, quits 60s after leaving a bound Wi-Fi. A run that never saw a bound Wi-Fi
+    /// (the user opened the app elsewhere on purpose) is left alone.
+    private func evaluateLeaveQuit() {
+        guard settings.wifiOnlyLaunch, matchedProfileForCurrentWiFi == nil else {
+            if matchedProfileForCurrentWiFi != nil {
+                sawBoundWiFi = true
+            }
+            leaveQuitTask?.cancel()
+            leaveQuitTask = nil
+            leaveQuitDeferredByUI = false
+            return
+        }
+        guard sawBoundWiFi, leaveQuitTask == nil else { return }
+        leaveQuitTask = Task { [weak self] in
+            // Suspending clock: time asleep does not count, so waking up does not quit before Wi-Fi rejoins.
+            try? await Task.sleep(for: .seconds(60), clock: .suspending)
+            guard !Task.isCancelled, let self else { return }
+            self.leaveQuitTask = nil
+            self.wifiMonitor.refreshSSID()
+            guard self.settings.wifiOnlyLaunch, self.matchedProfileForCurrentWiFi == nil else { return }
+            if self.isUIActive {
+                self.leaveQuitDeferredByUI = true
+            } else {
+                NSApp.terminate(nil)
+            }
         }
     }
 

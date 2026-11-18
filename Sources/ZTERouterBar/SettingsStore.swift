@@ -18,22 +18,27 @@ public enum MenuBarDisplayStyle: String, CaseIterable, Codable, Sendable, Identi
     }
 }
 
+/// `UserDefaults` keys. Shared with the Wi-Fi launch trigger, which reads them without building a `SettingsStore`.
+enum SettingsKeys {
+    static let profiles = "zte.router.profiles.v1"
+    static let activeProfileID = "zte.router.activeProfileID"
+    static let autoMatchByWiFi = "zte.router.autoMatchByWiFi"
+    static let pollingInterval = "zte.router.pollingInterval"
+    static let menuBarDisplayStyle = "zte.router.menuBarDisplayStyle"
+    static let globalShortcutEnabled = "zte.router.globalShortcutEnabled"
+    static let systemNotificationsEnabled = "zte.router.systemNotificationsEnabled"
+    static let watchdogConfig = "zte.router.watchdogConfig.v1"
+    static let watchdogDefaultsVersion = "zte.router.watchdogDefaultsVersion"
+    static let wifiOnlyLaunch = "zte.router.wifiOnlyLaunch"
+    static let wifiLaunchSuppressedSSID = "zte.router.wifiLaunchSuppressedSSID"
+}
+
 @MainActor
 @Observable
 final class SettingsStore {
-    private enum Keys {
-        static let profiles = "zte.router.profiles.v1"
-        static let activeProfileID = "zte.router.activeProfileID"
-        static let autoMatchByWiFi = "zte.router.autoMatchByWiFi"
-        static let pollingInterval = "zte.router.pollingInterval"
-        static let menuBarDisplayStyle = "zte.router.menuBarDisplayStyle"
-        static let globalShortcutEnabled = "zte.router.globalShortcutEnabled"
-        static let systemNotificationsEnabled = "zte.router.systemNotificationsEnabled"
-        static let watchdogConfig = "zte.router.watchdogConfig.v1"
-        static let watchdogDefaultsVersion = "zte.router.watchdogDefaultsVersion"
-    }
+    private typealias Keys = SettingsKeys
 
-    private static let currentWatchdogDefaultsVersion = 4
+    private static let currentWatchdogDefaultsVersion = 5
 
     var profiles: [RouterProfile] {
         didSet { saveProfiles() }
@@ -67,6 +72,11 @@ final class SettingsStore {
         didSet { saveWatchdogConfig() }
     }
 
+    /// Launch only while connected to a Wi-Fi bound to a profile; see `WiFiLaunchAgent`.
+    var wifiOnlyLaunch: Bool {
+        didSet { defaults.set(wifiOnlyLaunch, forKey: Keys.wifiOnlyLaunch) }
+    }
+
     var menuBarDisplayStyle: MenuBarDisplayStyle {
         get { MenuBarDisplayStyle(rawValue: menuBarDisplayStyleRaw) ?? .iconAndSignal }
         set { menuBarDisplayStyleRaw = newValue.rawValue }
@@ -82,11 +92,13 @@ final class SettingsStore {
         self.defaults = defaults
 
         let loadedProfiles: [RouterProfile]
+        var needsProfileSave = false
         if let data = defaults.data(forKey: Keys.profiles),
            let decoded = try? JSONDecoder().decode([RouterProfile].self, from: data),
            !decoded.isEmpty {
             loadedProfiles = decoded
         } else {
+            needsProfileSave = true
             loadedProfiles = [
                 RouterProfile(
                     id: UUID(),
@@ -119,6 +131,7 @@ final class SettingsStore {
 
         self.globalShortcutEnabled = defaults.object(forKey: Keys.globalShortcutEnabled) as? Bool ?? true
         self.systemNotificationsEnabled = defaults.object(forKey: Keys.systemNotificationsEnabled) as? Bool ?? true
+        self.wifiOnlyLaunch = defaults.bool(forKey: Keys.wifiOnlyLaunch)
 
         let savedVersion = defaults.integer(forKey: Keys.watchdogDefaultsVersion)
         if let wdData = defaults.data(forKey: Keys.watchdogConfig),
@@ -130,16 +143,23 @@ final class SettingsStore {
             self.watchdogConfig = WatchdogConfig()
         }
 
-        if savedVersion < Self.currentWatchdogDefaultsVersion {
+        if savedVersion < 4 {
             KeychainPasswordStore.purgeRetiredProxyPasswords()
             defaults.removeObject(forKey: "zte.router.url")
             defaults.removeObject(forKey: "zte.router.hashPreference")
         }
 
-        defaults.set(Self.currentWatchdogDefaultsVersion, forKey: Keys.watchdogDefaultsVersion)
-        saveProfiles()
-        saveWatchdogConfig()
-        defaults.set(activeProfileID.uuidString, forKey: Keys.activeProfileID)
+        // Write back only what this launch actually changed.
+        if savedVersion < Self.currentWatchdogDefaultsVersion {
+            saveWatchdogConfig()
+            defaults.set(Self.currentWatchdogDefaultsVersion, forKey: Keys.watchdogDefaultsVersion)
+        }
+        if needsProfileSave {
+            saveProfiles()
+        }
+        if defaults.string(forKey: Keys.activeProfileID) != activeProfileID.uuidString {
+            defaults.set(activeProfileID.uuidString, forKey: Keys.activeProfileID)
+        }
     }
 
     func updateProfile(_ profile: RouterProfile) {

@@ -280,16 +280,19 @@ struct WatchdogView: View {
 
                 Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 8) {
                     GridRow {
-                        numberInput("重连前防抖复检 (次)", value: $draftConfig.recheckBeforeAct, range: 0...10)
-                        numberInput("复检及重连后间隔 (s)", value: $draftConfig.recheckIntervalSec, range: 1...60)
+                        numberInput("持续异常多久才重连 (s)", value: $draftConfig.failureWindowSec, range: 10...600)
+                        numberInput("确认期复检间隔 (s)", value: $draftConfig.recheckIntervalSec, range: 1...60)
                     }
                     GridRow {
+                        numberInput("重连后保护期 (s)", value: $draftConfig.postReconnectGraceSec, range: 0...600)
                         numberInput("连续重连上限 (次)", value: $draftConfig.maxConsecutiveReconnects, range: 1...10)
+                    }
+                    GridRow {
                         numberInput("触发上限后冷却 (s)", value: $draftConfig.cooldownSec, range: 10...600)
                     }
                 }
 
-                Text("触发节奏：各端点按自身频率(s)与超时(s)独立检测；首轮判为异常后间隔 \(draftConfig.recheckIntervalSec)s 再复检 \(draftConfig.recheckBeforeAct) 次，即连续 \(draftConfig.recheckBeforeAct + 1) 次不通立刻触发重连。")
+                Text("触发节奏：各端点按自身频率(s)与超时(s)独立检测；判为异常后每 \(draftConfig.recheckIntervalSec)s 对全部端点复检，任一轮恢复即取消，持续异常满 \(draftConfig.failureWindowSec)s 才重连。重连后 \(draftConfig.postReconnectGraceSec)s 保护期内不探测、不重连，之后从头监测。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -317,7 +320,7 @@ struct WatchdogView: View {
             Text(label + ":")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .frame(width: 140, alignment: .leading)
+                .frame(width: 168, alignment: .leading)
             TextField("", value: value, format: .number)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 72)
@@ -401,7 +404,7 @@ struct WatchdogView: View {
         switch viewModel.watchdogPhase {
         case .idle: .secondary
         case .monitoring: .green
-        case .rechecking, .verifyingAfterReconnect: .orange
+        case .confirming, .settling: .orange
         case .reconnecting: .blue
         case .coolingDown, .paused: .orange
         }

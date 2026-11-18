@@ -217,11 +217,17 @@ struct ZTERouterCoreTests {
         #expect(stationQueries.count == 1)
         #expect(!(stationQueries[0].url?.absoluteString.contains("multi_data=1") ?? true))
 
-        // Background poll skips `station_list` and `lan_station_list` while keeping `wifi_access_sta_num`.
+        // Background poll skips `station_list` and `lan_station_list` while keeping `wifi_access_sta_num`,
+        // and is a single merged request that carries `loginfo` itself.
         let bgSnap = try await client.fetchStatus(includeStationLists: false)
         #expect(bgSnap.wirelessDeviceCount == 6)
         #expect(bgSnap.wifiStations.isEmpty)
         let capturedAfterBG = await transport.capturedRequests
+        let bgRequests = Array(capturedAfterBG.dropFirst(captured.count))
+        #expect(bgRequests.count == 1)
+        #expect(bgRequests.first?.httpMethod == "GET")
+        #expect(bgRequests.first?.url?.absoluteString.contains("loginfo") == true)
+        #expect(bgRequests.first?.url?.absoluteString.contains("multi_data=1") == true)
         let stationQueriesAfterBG = capturedAfterBG.filter {
             $0.httpMethod == "GET" && ($0.url?.absoluteString.contains("cmd=station_list") ?? false)
         }
@@ -234,6 +240,44 @@ struct ZTERouterCoreTests {
         #expect(postGoforms.contains("goformId=LOGOUT"))
         #expect(postGoforms.contains("goformId=DISCONNECT_NETWORK"))
         #expect(postGoforms.contains("goformId=CONNECT_NETWORK"))
+    }
+
+    @Test("Status poll re-logs in once after the session is kicked, without a separate loginfo query")
+    func testStatusPollRecoversKickedSession() async throws {
+        let transport = MockTransport()
+        let config = try RouterEndpointConfig(baseURLString: "http://192.168.8.1")
+        let client = ZTERouterClient(config: config, password: "fixture-password", transport: transport)
+
+        _ = try await client.fetchStatus(includeStationLists: false)
+        await transport.expireSession()
+        let snap = try await client.fetchStatus(includeStationLists: false)
+        #expect(snap.networkType == "SA")
+
+        let captured = await transport.capturedRequests
+        #expect(Self.loginPostCount(captured) == 2)
+        #expect(!captured.contains { $0.url?.absoluteString.contains("cmd=loginfo") ?? false })
+    }
+
+    @Test("Firmware that omits loginfo from the merged status query falls back instead of logging in every poll")
+    func testStatusPollFallsBackWhenLoginfoUnreliable() async throws {
+        let transport = MockTransport(omitLoginfoInStatusQuery: true)
+        let config = try RouterEndpointConfig(baseURLString: "http://192.168.8.1")
+        let client = ZTERouterClient(config: config, password: "fixture-password", transport: transport)
+
+        for _ in 0..<3 {
+            let snap = try await client.fetchStatus(includeStationLists: false)
+            #expect(snap.networkType == "SA")
+        }
+        let captured = await transport.capturedRequests
+        #expect(Self.loginPostCount(captured) == 1)
+        #expect(captured.contains { $0.url?.absoluteString.contains("cmd=loginfo") ?? false })
+    }
+
+    private static func loginPostCount(_ requests: [URLRequest]) -> Int {
+        requests.filter { req in
+            guard req.httpMethod == "POST", let body = req.httpBody, let text = String(data: body, encoding: .utf8) else { return false }
+            return text.contains("goformId=LOGIN")
+        }.count
     }
 
     @Test("Client surfaces wrongPassword error on code 3")
@@ -252,11 +296,14 @@ struct ZTERouterCoreTests {
         let cfg = WatchdogConfig()
         #expect(cfg.autoStart == true)
         #expect(cfg.triggerPolicy == .weighted)
-        #expect(cfg.recheckBeforeAct == 1)
-        #expect(cfg.recheckIntervalSec == 3)
+        #expect(cfg.failureWindowSec == 30)
+        #expect(cfg.recheckIntervalSec == 5)
+        #expect(cfg.postReconnectGraceSec == 45)
+        #expect(cfg.maxConsecutiveReconnects == 3)
+        #expect(cfg.cooldownSec == 300)
         #expect(cfg.endpoints.count == 3)
         #expect(cfg.endpoints[0].urlString == "https://661313.xyz/test/generate_204")
-        #expect(cfg.endpoints[0].weight == 3)
+        #expect(cfg.endpoints[0].weight == 1)
         #expect(cfg.endpoints[0].intervalSec == 15)
         #expect(cfg.endpoints[0].timeoutSec == 3)
         #expect(cfg.endpoints[1].weight == 1)
@@ -295,15 +342,49 @@ struct ZTERouterCoreTests {
         #expect(migrated104.endpoints[0].timeoutSec == 3)
         #expect(migrated104.endpoints[1].intervalSec == 25)
         #expect(migrated104.endpoints[1].timeoutSec == 5)
+        #expect(migrated104.endpoints[0].weight == 1)
+        #expect(migrated104.recheckIntervalSec == 5)
+        #expect(migrated104.cooldownSec == 300)
+        #expect(migrated104.failureWindowSec == 30)
+        #expect(migrated104.postReconnectGraceSec == 45)
+
+        // v1.0.5 (defaults version 4) config with user-tuned timeouts: only the hair-trigger defaults change.
+        let v105JSON = Data("""
+        {
+          "autoStart": true,
+          "recheckBeforeAct": 1,
+          "recheckIntervalSec": 3,
+          "maxConsecutiveReconnects": 3,
+          "cooldownSec": 60,
+          "triggerPolicy": "weighted",
+          "onlyWhenWiFiMatched": false,
+          "endpoints": [
+            {"id":"00000000-0000-0000-0000-000000000001","isEnabled":true,"name":"661313 204","urlString":"https://661313.xyz/test/generate_204","weight":3,"intervalSec":15,"timeoutSec":10},
+            {"id":"00000000-0000-0000-0000-000000000002","isEnabled":true,"name":"YouTube 204","urlString":"https://www.youtube.com/generate_204","weight":1,"intervalSec":33,"timeoutSec":10},
+            {"id":"00000000-0000-0000-0000-000000000003","isEnabled":true,"name":"Custom","urlString":"https://custom.invalid/ping","weight":3,"intervalSec":20,"timeoutSec":10}
+          ]
+        }
+        """.utf8)
+        let migrated105 = try JSONDecoder().decode(WatchdogConfig.self, from: v105JSON).migratingLegacyDefaults(fromVersion: 4)
+        #expect(migrated105.endpoints.map(\.weight) == [1, 1, 3])
+        #expect(migrated105.endpoints.map(\.timeoutSec) == [10, 10, 10])
+        #expect(migrated105.endpoints.map(\.intervalSec) == [15, 33, 20])
+        #expect(migrated105.recheckIntervalSec == 5)
+        #expect(migrated105.cooldownSec == 300)
+        #expect(migrated105.failureWindowSec == 30)
+        #expect(migrated105.postReconnectGraceSec == 45)
+        // Already-migrated configs keep whatever the user chose afterwards.
+        var tuned = migrated105
+        tuned.recheckIntervalSec = 3
+        tuned.cooldownSec = 60
+        #expect(tuned.migratingLegacyDefaults(fromVersion: 5) == tuned)
 
         // Legacy untouched preset sets migrate cleanly to v1.1.0 defaults
         for oldURLs in WatchdogEndpoint.legacyPresetURLSets {
             let legacy = WatchdogConfig(
-                recheckBeforeAct: 3,
                 triggerPolicy: .allUnreachable,
                 endpoints: oldURLs.map { WatchdogEndpoint(name: "Legacy", urlString: $0) }
             ).migratingLegacyDefaults(fromVersion: 0)
-            #expect(legacy.recheckBeforeAct == 1)
             #expect(legacy.triggerPolicy == .weighted)
             #expect(legacy.endpoints.map(\.urlString) == WatchdogEndpoint.defaultPresets.map(\.urlString))
         }
@@ -322,13 +403,19 @@ struct ZTERouterCoreTests {
         #expect(WatchdogEvaluator.isHealthy(outcomes: [primaryFail, sec1Fail, sec2Fail], policy: .allUnreachable) == false)
         #expect(WatchdogEvaluator.isHealthy(outcomes: [primaryOK, sec1Fail], policy: .anyUnreachable) == false)
         #expect(WatchdogEvaluator.isHealthy(outcomes: [primaryOK, sec1OK], policy: .anyUnreachable) == true)
+
+        // Default 1/1/1 weights: one endpoint down is healthy, two down is not.
+        let equalOK = EndpointProbeOutcome(id: UUID(), name: "E", urlString: "https://example.invalid", weight: 1, reachable: true, statusCode: 204)
+        let equalFail = EndpointProbeOutcome(id: UUID(), name: "E", urlString: "https://example.invalid", weight: 1, reachable: false, errorMessage: "timeout")
+        #expect(WatchdogEvaluator.isHealthy(outcomes: [equalFail, equalOK, equalOK], policy: .weighted) == true)
+        #expect(WatchdogEvaluator.isHealthy(outcomes: [equalFail, equalFail, equalOK], policy: .weighted) == false)
     }
 
     @Test("Watchdog schedules per-endpoint independent intervals cleanly")
     func testPerEndpointScheduling() async {
         let fast = WatchdogEndpoint(name: "Fast", urlString: "https://fast.invalid", weight: 3, intervalSec: 15, timeoutSec: 3)
         let slow = WatchdogEndpoint(name: "Slow", urlString: "https://slow.invalid", weight: 1, intervalSec: 33, timeoutSec: 4)
-        var cfg = WatchdogConfig(recheckBeforeAct: 1, triggerPolicy: .weighted)
+        var cfg = WatchdogConfig(triggerPolicy: .weighted)
         cfg.endpoints = [fast, slow]
 
         let counter = EndpointCallCounter()
@@ -354,103 +441,144 @@ struct ZTERouterCoreTests {
         #expect(slowCount >= 2 && slowCount < fastCount)
     }
 
-    @Test("Watchdog ignores transient jitter when recheck recovers")
-    func testWatchdogJitterRecheckPreventsReconnect() async {
-        // Round 1 fails, Recheck 1 recovers -> zero reconnects
-        let prober = ScriptedProber(roundResults: [false, true, true])
-        let router = MockReconnectRouter()
-        var cfg = WatchdogConfig(recheckBeforeAct: 3)
-        cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid")]
-
-        let runner = WatchdogRunner(sleep: { _ in try await Task.sleep(for: .milliseconds(5)) })
-        let collector = PhaseCollector()
-        let task = Task {
-            await runner.run(config: cfg, prober: prober, router: router) { event in
-                await collector.record(event)
-            }
-        }
-
-        // Wait until at least 3 probe rounds execute
-        for _ in 0..<50 {
-            if await prober.completedRounds >= 3 { break }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        task.cancel()
-        await task.value
-
-        let reconnects = await router.reconnectCount
-        #expect(reconnects == 0)
-    }
-
-    @Test("Watchdog triggers reconnect after confirmed failure and cools down after repeated failures")
-    func testWatchdogReconnectAndCooldown() async {
-        // 1 initial fail + 2 recheck fails -> reconnect #1 -> post-check fails -> reconnect #2 -> post-check fails -> cooldown -> next round succeeds
-        let prober = ScriptedProber(roundResults: [
-            false, false, false, // initial + 2 rechecks
-            false,               // post reconnect #1 still failing
-            false,               // post reconnect #2 still failing -> cooldown
-            true                 // after cooldown recovered
-        ])
-        let router = MockReconnectRouter()
-        var cfg = WatchdogConfig(recheckBeforeAct: 2, maxConsecutiveReconnects: 2, cooldownSec: 60)
-        cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid")]
-
-        let runner = WatchdogRunner(sleep: { _ in try await Task.sleep(for: .milliseconds(5)) })
-        let collector = PhaseCollector()
-        let task = Task {
-            await runner.run(config: cfg, prober: prober, router: router) { event in
-                await collector.record(event)
-            }
-        }
-
-        for _ in 0..<80 {
-            if await prober.completedRounds >= 6 { break }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        task.cancel()
-        await task.value
-
-        let reconnects = await router.reconnectCount
-        let phases = await collector.phases
-        let triggerCount = await collector.autoTriggerCount
-        let finishCount = await collector.autoFinishCount
-        #expect(reconnects == 2)
-        #expect(triggerCount == 2)
-        #expect(finishCount == 2)
-        #expect(phases.contains(.reconnecting))
-        #expect(phases.contains(.verifyingAfterReconnect))
-        #expect(phases.contains(.coolingDown(seconds: 60)))
-    }
-
-    @Test("Watchdog default recheckBeforeAct=1 triggers reconnect immediately after 2 consecutive failures")
-    func testWatchdogTwoConsecutiveFailuresReconnect() async {
-        // Round 1 fails -> Recheck 1 fails -> immediate reconnect -> post check succeeds
+    @Test("Watchdog ignores a blip: failing rounds that recover inside the window never reconnect")
+    func testWatchdogBlipInsideWindowDoesNotReconnect() async {
+        // Round 1 fails, first recheck fails too (the old 2-fail trigger), second recheck recovers.
         let prober = ScriptedProber(roundResults: [false, false, true])
         let router = MockReconnectRouter()
         var cfg = WatchdogConfig()
-        cfg.endpoints = [WatchdogEndpoint(name: "Primary", urlString: "https://example.invalid", weight: 3)]
+        cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid")]
 
-        let runner = WatchdogRunner(sleep: { _ in try await Task.sleep(for: .milliseconds(5)) })
         let collector = PhaseCollector()
+        let task = Task {
+            await WatchdogRunner(sleep: Self.fastSleep).run(config: cfg, prober: prober, router: router) { event in
+                await collector.record(event)
+            }
+        }
+        await Self.waitUntil { await prober.completedRounds >= 5 }
+        task.cancel()
+        await task.value
+
+        #expect(await router.reconnectCount == 0)
+        let phases = await collector.phases
+        #expect(phases.contains(.confirming(elapsedSec: 0, windowSec: 30)))
+        #expect(phases.contains(.confirming(elapsedSec: 5, windowSec: 30)))
+        #expect(!phases.contains(.reconnecting))
+    }
+
+    @Test("Watchdog reconnects once after a full failure window, then stays silent for the grace period")
+    func testWatchdogSustainedFailureReconnectsOnceThenSettles() async {
+        // 1 failing round + 6 failing rechecks (6 x 5s = 30s window) -> reconnect -> recovered afterwards.
+        let prober = ScriptedProber(roundResults: Array(repeating: false, count: 7))
+        let router = MockReconnectRouter()
+        var cfg = WatchdogConfig()
+        cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid")]
+
+        let collector = PhaseCollector()
+        let sleeps = SleepRecorder()
+        let runner = WatchdogRunner(sleep: { duration in
+            await sleeps.record(duration)
+            try await Task.sleep(for: .milliseconds(2))
+        })
         let task = Task {
             await runner.run(config: cfg, prober: prober, router: router) { event in
                 await collector.record(event)
             }
         }
-
-        for _ in 0..<80 {
-            let finishes = await collector.autoFinishCount
-            let rounds = await prober.completedRounds
-            if finishes >= 1 && rounds >= 3 { break }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
+        await Self.waitUntil { await prober.completedRounds >= 10 }
         task.cancel()
         await task.value
 
-        let reconnects = await router.reconnectCount
-        let triggers = await collector.autoTriggerCount
-        #expect(reconnects == 1)
-        #expect(triggers == 1)
+        #expect(await router.reconnectCount == 1)
+        #expect(await collector.autoTriggerCount == 1)
+        #expect(await collector.autoFinishCount == 1)
+
+        let phases = await collector.phases
+        let beforeReconnect = phases.prefix { $0 != .reconnecting }
+        #expect(beforeReconnect.filter(Self.isConfirming).count == 6)
+        #expect(phases.contains(.settling(seconds: 45)))
+        #expect(!phases.contains(.coolingDown(seconds: 300)))
+
+        // The grace period is one uninterrupted sleep: no probe happens inside it.
+        let recorded = await sleeps.durations
+        #expect(recorded.contains(.seconds(45)))
+        let graceIndex = recorded.firstIndex(of: .seconds(45))
+        #expect(graceIndex.map { recorded[..<$0].filter { $0 == .seconds(5) }.count } == 6)
+    }
+
+    @Test("Slow failing probes count toward the failure window")
+    func testWatchdogWindowCountsProbeDuration() async {
+        // Each failing recheck takes 10s on top of the 5s pause: 2 rechecks cover the 30s window.
+        let prober = ScriptedProber(roundResults: Array(repeating: false, count: 3), elapsedMs: 10_000)
+        let router = MockReconnectRouter()
+        var cfg = WatchdogConfig()
+        cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid", timeoutSec: 10)]
+
+        let collector = PhaseCollector()
+        let task = Task {
+            await WatchdogRunner(sleep: Self.fastSleep).run(config: cfg, prober: prober, router: router) { event in
+                await collector.record(event)
+            }
+        }
+        await Self.waitUntil { await prober.completedRounds >= 5 }
+        task.cancel()
+        await task.value
+
+        #expect(await router.reconnectCount == 1)
+        let phases = await collector.phases
+        #expect(phases.prefix { $0 != .reconnecting }.filter(Self.isConfirming) == [
+            .confirming(elapsedSec: 0, windowSec: 30),
+            .confirming(elapsedSec: 15, windowSec: 30)
+        ])
+    }
+
+    @Test("A second reconnect needs a new full window, and repeated reconnects end in a cooldown")
+    func testWatchdogRepeatedReconnectsCoolDown() async {
+        // window 10s / recheck 5s = 2 rechecks. Fail (1+2) -> reconnect #1 -> grace -> fail (1+2) -> reconnect #2 -> cooldown -> recovered.
+        let prober = ScriptedProber(roundResults: Array(repeating: false, count: 6))
+        let router = MockReconnectRouter()
+        var cfg = WatchdogConfig(failureWindowSec: 10, maxConsecutiveReconnects: 2, cooldownSec: 60)
+        cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid")]
+
+        let collector = PhaseCollector()
+        let task = Task {
+            await WatchdogRunner(sleep: Self.fastSleep).run(config: cfg, prober: prober, router: router) { event in
+                await collector.record(event)
+            }
+        }
+        await Self.waitUntil { await prober.completedRounds >= 9 }
+        task.cancel()
+        await task.value
+
+        #expect(await router.reconnectCount == 2)
+        #expect(await collector.autoTriggerCount == 2)
+
+        let phases = await collector.phases
+        let reconnectIndices = phases.indices.filter { phases[$0] == .reconnecting }
+        #expect(reconnectIndices.count == 2)
+        if reconnectIndices.count == 2 {
+            let between = phases[reconnectIndices[0]..<reconnectIndices[1]]
+            #expect(between.contains(.settling(seconds: 45)))
+            #expect(between.filter(Self.isConfirming).count == 2)
+        }
+        #expect(phases.contains(.coolingDown(seconds: 60)))
+        #expect(phases.filter { $0 == .settling(seconds: 45) }.count == 1)
+    }
+
+    private static let fastSleep: @Sendable (Duration) async throws -> Void = { _ in
+        try await Task.sleep(for: .milliseconds(2))
+    }
+
+    private static func isConfirming(_ phase: WatchdogPhase) -> Bool {
+        if case .confirming = phase { return true }
+        return false
+    }
+
+    private static func waitUntil(_ condition: @Sendable () async -> Bool) async {
+        for _ in 0..<400 {
+            if await condition() { return }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
     }
 
     @Test("Signal rating assessment and WAN IP change notification formatting")
@@ -563,12 +691,22 @@ private actor CountingProber: EndpointProbing {
     }
 }
 
+private actor SleepRecorder {
+    private(set) var durations: [Duration] = []
+
+    func record(_ duration: Duration) {
+        durations.append(duration)
+    }
+}
+
 private actor ScriptedProber: EndpointProbing {
     private var roundResults: [Bool]
+    private let elapsedMs: Int
     private(set) var completedRounds = 0
 
-    init(roundResults: [Bool]) {
+    init(roundResults: [Bool], elapsedMs: Int = 12) {
         self.roundResults = roundResults
+        self.elapsedMs = elapsedMs
     }
 
     func check(_ endpoint: WatchdogEndpoint) async -> EndpointProbeOutcome {
@@ -582,7 +720,7 @@ private actor ScriptedProber: EndpointProbing {
             weight: endpoint.weight,
             reachable: ok,
             statusCode: ok ? 204 : nil,
-            elapsedMs: 12,
+            elapsedMs: elapsedMs,
             errorMessage: ok ? nil : "simulated failure"
         )
     }
@@ -623,15 +761,22 @@ private actor MockTransport: HTTPTransport {
     private let rejectLogin: Bool
     private var simulateKickedOutBeforeDisconnect: Bool
     private var occupiedByOtherSession: Bool
+    private let omitLoginfoInStatusQuery: Bool
 
     init(
         rejectLogin: Bool = false,
         simulateKickedOutBeforeDisconnect: Bool = false,
-        simulateDuplicateUntilLogout: Bool = false
+        simulateDuplicateUntilLogout: Bool = false,
+        omitLoginfoInStatusQuery: Bool = false
     ) {
         self.rejectLogin = rejectLogin
         self.simulateKickedOutBeforeDisconnect = simulateKickedOutBeforeDisconnect
         self.occupiedByOtherSession = simulateDuplicateUntilLogout
+        self.omitLoginfoInStatusQuery = omitLoginfoInStatusQuery
+    }
+
+    func expireSession() {
+        loggedIn = false
     }
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
@@ -670,6 +815,7 @@ private actor MockTransport: HTTPTransport {
                     case "wifi_chip1_ssid1_access_sta_num": payload[key] = "1"
                     case "wifi_chip2_ssid1_access_sta_num": payload[key] = "5"
                     case "ppp_status": payload[key] = wanConnected ? "ipv4_ipv6_connected" : "ppp_disconnected"
+                    case "loginfo": payload[key] = (loggedIn && !omitLoginfoInStatusQuery) ? "ok" : ""
                     default: payload[key] = ""
                     }
                 }

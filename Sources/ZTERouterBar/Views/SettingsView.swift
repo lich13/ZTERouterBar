@@ -11,6 +11,7 @@ struct SettingsView: View {
     @State private var wifiSSIDsDraft: String = ""
     @State private var hashDraft: AuthHashPreference = .auto
     @State private var savedNote: String?
+    @State private var editingHasStoredPassword: Bool = false
 
     var body: some View {
         Form {
@@ -208,6 +209,7 @@ struct SettingsView: View {
                         )
                         savedNote = nil
                         await viewModel.saveProfile(updated, password: passwordDraft, activateAndTest: true)
+                        editingHasStoredPassword = KeychainPasswordStore.loadPassword(forProfileID: targetID) != nil
                         if viewModel.lastError == nil {
                             savedNote = "已保存并成功连接「\(updated.name)」。"
                         }
@@ -215,10 +217,10 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.borderedProminent)
 
-                if let targetID = editingProfileID,
-                   KeychainPasswordStore.loadPassword(forProfileID: targetID) != nil {
+                if let targetID = editingProfileID, editingHasStoredPassword {
                     Button("清除此配置密码", role: .destructive) {
                         viewModel.clearPassword(forProfileID: targetID)
+                        editingHasStoredPassword = false
                         passwordDraft = ""
                         savedNote = "已从钥匙串移除此配置的密码。"
                     }
@@ -259,10 +261,22 @@ struct SettingsView: View {
                 set: { viewModel.settings.globalShortcutEnabled = $0 }
             ))
 
-            Toggle("登录 macOS 时自动启动", isOn: Binding(
-                get: { viewModel.launchAtLoginEnabled },
-                set: { viewModel.setLaunchAtLogin($0) }
-            ))
+            Picker("启动方式", selection: Binding(
+                get: { viewModel.launchMode },
+                set: { viewModel.setLaunchMode($0) }
+            )) {
+                ForEach(LaunchMode.allCases) { mode in
+                    Text(mode.displayName)
+                        .tag(mode)
+                        .selectionDisabled(mode == .wifiOnly && !viewModel.canUseWiFiOnlyLaunch)
+                }
+            }
+
+            Text(viewModel.canUseWiFiOnlyLaunch
+                ? "「仅连接已绑定 Wi-Fi 时启动」：平时不常驻；连上任一配置绑定的 Wi-Fi 时由系统自动拉起，离开约 60 秒后自动退出。在该 Wi-Fi 下手动退出后，需重新连接该 Wi-Fi 或手动打开才会再次启动。"
+                : "「仅连接已绑定 Wi-Fi 时启动」需要先为路由器配置绑定 Wi-Fi 名称，并授权定位权限以识别当前 Wi-Fi。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -274,7 +288,9 @@ struct SettingsView: View {
         urlDraft = profile.routerURLString
         wifiSSIDsDraft = profile.wifiSSIDs.joined(separator: ", ")
         hashDraft = profile.hashPreference
-        passwordDraft = KeychainPasswordStore.loadPassword(forProfileID: profile.id) ?? ""
+        let storedPassword = KeychainPasswordStore.loadPassword(forProfileID: profile.id)
+        passwordDraft = storedPassword ?? ""
+        editingHasStoredPassword = storedPassword != nil
         savedNote = nil
     }
 

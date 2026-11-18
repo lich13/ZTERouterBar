@@ -120,7 +120,7 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
                 isEnabled: true,
                 name: "661313 204",
                 urlString: "https://661313.xyz/test/generate_204",
-                weight: 3,
+                weight: 1,
                 intervalSec: 15,
                 timeoutSec: 3
             ),
@@ -146,29 +146,35 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
 
 public struct WatchdogConfig: Codable, Equatable, Sendable {
     public var autoStart: Bool
-    public var recheckBeforeAct: Int
+    /// Seconds of continuous failure (confirmed by full re-probes) required before a reconnect.
+    public var failureWindowSec: Int
+    /// Interval between full re-probes while confirming a failure.
     public var recheckIntervalSec: Int
+    /// Quiet period after a reconnect: no probing, no verdict, no reconnect.
+    public var postReconnectGraceSec: Int
     public var maxConsecutiveReconnects: Int
     public var cooldownSec: Int
     public var triggerPolicy: WatchdogTriggerPolicy
     public var onlyWhenWiFiMatched: Bool
     public var endpoints: [WatchdogEndpoint]
 
-    public static let defaultRecheckBeforeAct = 1
-    public static let defaultRecheckIntervalSec = 3
+    public static let defaultFailureWindowSec = 30
+    public static let defaultRecheckIntervalSec = 5
+    public static let defaultPostReconnectGraceSec = 45
     public static let defaultMaxConsecutiveReconnects = 3
-    public static let defaultCooldownSec = 60
+    public static let defaultCooldownSec = 300
 
     enum CodingKeys: String, CodingKey {
-        case autoStart, recheckBeforeAct, recheckIntervalSec, maxConsecutiveReconnects, cooldownSec, triggerPolicy, onlyWhenWiFiMatched, endpoints
+        case autoStart, failureWindowSec, recheckIntervalSec, postReconnectGraceSec, maxConsecutiveReconnects, cooldownSec, triggerPolicy, onlyWhenWiFiMatched, endpoints
         // Legacy keys decoded only when upgrading older persisted configs that lack per-endpoint timing.
         case checkTimeoutMs, pollIntervalSec
     }
 
     public init(
         autoStart: Bool = true,
-        recheckBeforeAct: Int = WatchdogConfig.defaultRecheckBeforeAct,
+        failureWindowSec: Int = WatchdogConfig.defaultFailureWindowSec,
         recheckIntervalSec: Int = WatchdogConfig.defaultRecheckIntervalSec,
+        postReconnectGraceSec: Int = WatchdogConfig.defaultPostReconnectGraceSec,
         maxConsecutiveReconnects: Int = WatchdogConfig.defaultMaxConsecutiveReconnects,
         cooldownSec: Int = WatchdogConfig.defaultCooldownSec,
         triggerPolicy: WatchdogTriggerPolicy = .weighted,
@@ -176,8 +182,9 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
         endpoints: [WatchdogEndpoint] = WatchdogEndpoint.defaultPresets
     ) {
         self.autoStart = autoStart
-        self.recheckBeforeAct = recheckBeforeAct
+        self.failureWindowSec = failureWindowSec
         self.recheckIntervalSec = recheckIntervalSec
+        self.postReconnectGraceSec = postReconnectGraceSec
         self.maxConsecutiveReconnects = maxConsecutiveReconnects
         self.cooldownSec = cooldownSec
         self.triggerPolicy = triggerPolicy
@@ -188,8 +195,9 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         autoStart = try container.decodeIfPresent(Bool.self, forKey: .autoStart) ?? true
-        recheckBeforeAct = try container.decodeIfPresent(Int.self, forKey: .recheckBeforeAct) ?? Self.defaultRecheckBeforeAct
+        failureWindowSec = try container.decodeIfPresent(Int.self, forKey: .failureWindowSec) ?? Self.defaultFailureWindowSec
         recheckIntervalSec = try container.decodeIfPresent(Int.self, forKey: .recheckIntervalSec) ?? Self.defaultRecheckIntervalSec
+        postReconnectGraceSec = try container.decodeIfPresent(Int.self, forKey: .postReconnectGraceSec) ?? Self.defaultPostReconnectGraceSec
         maxConsecutiveReconnects = try container.decodeIfPresent(Int.self, forKey: .maxConsecutiveReconnects) ?? Self.defaultMaxConsecutiveReconnects
         cooldownSec = try container.decodeIfPresent(Int.self, forKey: .cooldownSec) ?? Self.defaultCooldownSec
         triggerPolicy = try container.decodeIfPresent(WatchdogTriggerPolicy.self, forKey: .triggerPolicy) ?? .weighted
@@ -210,8 +218,9 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(autoStart, forKey: .autoStart)
-        try container.encode(recheckBeforeAct, forKey: .recheckBeforeAct)
+        try container.encode(failureWindowSec, forKey: .failureWindowSec)
         try container.encode(recheckIntervalSec, forKey: .recheckIntervalSec)
+        try container.encode(postReconnectGraceSec, forKey: .postReconnectGraceSec)
         try container.encode(maxConsecutiveReconnects, forKey: .maxConsecutiveReconnects)
         try container.encode(cooldownSec, forKey: .cooldownSec)
         try container.encode(triggerPolicy, forKey: .triggerPolicy)
@@ -227,58 +236,58 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
 
     public func clamped() -> WatchdogConfig {
         var copy = self
-        copy.recheckBeforeAct = min(max(recheckBeforeAct, 0), 10)
+        copy.failureWindowSec = min(max(failureWindowSec, 10), 600)
         copy.recheckIntervalSec = min(max(recheckIntervalSec, 1), 60)
+        copy.postReconnectGraceSec = min(max(postReconnectGraceSec, 0), 600)
         copy.maxConsecutiveReconnects = min(max(maxConsecutiveReconnects, 1), 10)
         copy.cooldownSec = min(max(cooldownSec, 10), 600)
         copy.endpoints = endpoints.map { $0.clamped() }
         return copy
     }
 
-    /// One-time migration from v1.0.2–v1.0.4 configs to v1.1.0 per-endpoint seconds and `/test/generate_204`.
+    /// One-time migration of persisted configs. Versions below 4 predate per-endpoint seconds and
+    /// `/test/generate_204`; versions below 5 predate the sustained-failure window and still carry
+    /// the old hair-trigger defaults (661313 weight 3, 3s recheck, 60s cooldown).
     public func migratingLegacyDefaults(fromVersion version: Int) -> WatchdogConfig {
-        guard version < 4 else { return clamped() }
+        guard version < 5 else { return clamped() }
         var copy = self
-        let currentURLs = copy.endpoints.map(\.urlString)
-        if WatchdogEndpoint.legacyPresetURLSets.contains(currentURLs) {
-            copy.endpoints = WatchdogEndpoint.defaultPresets
-        } else {
-            copy.endpoints.removeAll {
-                $0.urlString.contains("github.githubassets.com") || $0.urlString.contains("dropbox.com/robots.txt")
-            }
-            if let legacyIdx = copy.endpoints.firstIndex(where: { $0.urlString.contains("661313.xyz/test/success.txt") }) {
-                copy.endpoints[legacyIdx].name = "661313 204"
-                copy.endpoints[legacyIdx].urlString = "https://661313.xyz/test/generate_204"
-                copy.endpoints[legacyIdx].weight = max(copy.endpoints[legacyIdx].weight, 3)
-                copy.endpoints[legacyIdx].intervalSec = 15
-                copy.endpoints[legacyIdx].timeoutSec = 3
-            } else if !copy.endpoints.contains(where: { $0.urlString.contains("661313.xyz/test") }) {
-                copy.endpoints.insert(WatchdogEndpoint.defaultPresets[0], at: 0)
+        if version < 4 {
+            let currentURLs = copy.endpoints.map(\.urlString)
+            if WatchdogEndpoint.legacyPresetURLSets.contains(currentURLs) {
+                copy.endpoints = WatchdogEndpoint.defaultPresets
+            } else {
+                copy.endpoints.removeAll {
+                    $0.urlString.contains("github.githubassets.com") || $0.urlString.contains("dropbox.com/robots.txt")
+                }
+                if let legacyIdx = copy.endpoints.firstIndex(where: { $0.urlString.contains("661313.xyz/test/success.txt") }) {
+                    copy.endpoints[legacyIdx].name = "661313 204"
+                    copy.endpoints[legacyIdx].urlString = "https://661313.xyz/test/generate_204"
+                    copy.endpoints[legacyIdx].intervalSec = 15
+                    copy.endpoints[legacyIdx].timeoutSec = 3
+                } else if !copy.endpoints.contains(where: { $0.urlString.contains("661313.xyz/test") }) {
+                    copy.endpoints.insert(WatchdogEndpoint.defaultPresets[0], at: 0)
+                }
             }
         }
-        if version < 3 {
-            if copy.triggerPolicy == .allUnreachable {
-                copy.triggerPolicy = .weighted
-            }
-            if copy.recheckBeforeAct == 3 {
-                copy.recheckBeforeAct = WatchdogConfig.defaultRecheckBeforeAct
-            }
+        if version < 3, copy.triggerPolicy == .allUnreachable {
+            copy.triggerPolicy = .weighted
+        }
+        for idx in copy.endpoints.indices
+        where copy.endpoints[idx].urlString.contains("661313.xyz/test/generate_204") && copy.endpoints[idx].weight == 3 {
+            copy.endpoints[idx].weight = 1
+        }
+        if copy.recheckIntervalSec == 3 {
+            copy.recheckIntervalSec = WatchdogConfig.defaultRecheckIntervalSec
+        }
+        if copy.cooldownSec == 60 {
+            copy.cooldownSec = WatchdogConfig.defaultCooldownSec
         }
         return copy.clamped()
     }
 
-    /// Returns a copy keeping current endpoints while restoring all strategy and debounce parameters to defaults.
+    /// Returns a copy keeping current endpoints while restoring all strategy and timing parameters to defaults.
     public func withDefaultParameters() -> WatchdogConfig {
-        WatchdogConfig(
-            autoStart: true,
-            recheckBeforeAct: WatchdogConfig.defaultRecheckBeforeAct,
-            recheckIntervalSec: WatchdogConfig.defaultRecheckIntervalSec,
-            maxConsecutiveReconnects: WatchdogConfig.defaultMaxConsecutiveReconnects,
-            cooldownSec: WatchdogConfig.defaultCooldownSec,
-            triggerPolicy: .weighted,
-            onlyWhenWiFiMatched: false,
-            endpoints: endpoints
-        )
+        WatchdogConfig(endpoints: endpoints)
     }
 }
 
@@ -319,16 +328,11 @@ public struct EndpointProbeOutcome: Equatable, Identifiable, Sendable {
 public enum WatchdogPhase: Equatable, Sendable {
     case idle
     case monitoring
-    case rechecking(attempt: Int, total: Int)
+    case confirming(elapsedSec: Int, windowSec: Int)
     case reconnecting
-    case verifyingAfterReconnect
+    case settling(seconds: Int)
     case coolingDown(seconds: Int)
     case paused(reason: String)
-
-    public var isActive: Bool {
-        if case .idle = self { return false }
-        return true
-    }
 
     public var displayLabel: String {
         switch self {
@@ -336,12 +340,12 @@ public enum WatchdogPhase: Equatable, Sendable {
             return "未启动"
         case .monitoring:
             return "守护运行中"
-        case let .rechecking(attempt, total):
-            return "抖动复检中 (\(attempt)/\(total))"
+        case let .confirming(elapsedSec, windowSec):
+            return "异常确认中 (\(elapsedSec)/\(windowSec)s)"
         case .reconnecting:
             return "正在自动重连外网…"
-        case .verifyingAfterReconnect:
-            return "重连后复检确认中…"
+        case let .settling(seconds):
+            return "重连后保护期 (\(seconds)s)"
         case let .coolingDown(seconds):
             return "连续重连冷却 (\(seconds)s)"
         case let .paused(reason):

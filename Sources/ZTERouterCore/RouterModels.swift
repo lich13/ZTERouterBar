@@ -230,8 +230,9 @@ public struct RouterStatusSnapshot: Equatable, Sendable {
     public let wifiAccessStationCount: Int?
     public let wifi24GCount: Int?
     public let wifi5GCount: Int?
-    public let wifiStations: [ConnectedStation]
-    public let lanStations: [ConnectedStation]
+    /// Mutable so a poll that skipped the station queries can keep the previous lists.
+    public var wifiStations: [ConnectedStation]
+    public var lanStations: [ConnectedStation]
     public let versionInfo: RouterVersionInfo
 
     public var wirelessDeviceCount: Int {

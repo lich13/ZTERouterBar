@@ -36,18 +36,29 @@ public enum RouterStatusParser {
         "wifi_chip2_ssid1_access_sta_num", "wifi_chip2_ssid2_access_sta_num"
     ]
 
+    /// Everything a status poll needs in one `multi_data=1` request. `loginfo` rides along (as it does in
+    /// ZTE's own WebUI poll) so the session check costs no extra round trip.
+    public static let statusCmds: [String] = primarySignalCmds + secondaryDashboardCmds + ["loginfo"]
+
     public static func parse(
         jsonDataList: [Data],
         fetchedAt: Date = Date()
     ) throws -> RouterStatusSnapshot {
+        parse(
+            jsonObjects: jsonDataList.compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] },
+            fetchedAt: fetchedAt
+        )
+    }
+
+    public static func parse(
+        jsonObjects: [[String: Any]],
+        fetchedAt: Date = Date()
+    ) -> RouterStatusSnapshot {
         var rawStrings: [String: String] = [:]
         var wifiStations: [ConnectedStation] = []
         var lanStations: [ConnectedStation] = []
 
-        for data in jsonDataList {
-            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                continue
-            }
+        for object in jsonObjects {
             for (key, value) in object {
                 if key == "station_list", let stations = decodeStations(from: value, kind: .wireless) {
                     wifiStations = stations

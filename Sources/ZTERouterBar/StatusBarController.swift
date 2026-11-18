@@ -39,6 +39,10 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
+    }
+
+    /// Built on open and dropped on close, so no SwiftUI graph re-evaluates on every poll while hidden.
+    private func makePopoverContent() -> NSViewController {
         let rootView = PopoverView(
             viewModel: viewModel,
             onOpenDashboard: { [weak self] tab in
@@ -49,11 +53,18 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
                 self?.closePopover()
                 self?.openDashboard(tab: .settings)
             },
-            onQuit: {
-                NSApplication.shared.terminate(nil)
+            onQuit: { [weak self] in
+                self?.quitByUser()
             }
         )
-        popover.contentViewController = NSHostingController(rootView: rootView)
+        let hosting = NSHostingController(rootView: rootView)
+        hosting.view.layoutSubtreeIfNeeded()
+        return hosting
+    }
+
+    private func quitByUser() {
+        viewModel.noteUserQuit()
+        NSApplication.shared.terminate(nil)
     }
 
     // MARK: - Observation
@@ -215,6 +226,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
 
     private func openPopover() {
         guard let button = statusItem.button else { return }
+        let content = makePopoverContent()
+        popover.contentViewController = content
+        popover.contentSize = content.view.fittingSize
         isPopoverShown = true
         updateActiveState()
         NSApp.activate(ignoringOtherApps: true)
@@ -226,6 +240,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
+        popover.contentViewController = nil
         isPopoverShown = false
         updateActiveState()
     }
@@ -342,7 +357,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
     }
 
     @objc private func menuQuit() {
-        NSApplication.shared.terminate(nil)
+        quitByUser()
     }
 
     // MARK: - Window Management
@@ -379,6 +394,12 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         if closing === dashboardWindow {
             NSApp.setActivationPolicy(.accessory)
             Task { @MainActor in
+                // Release the window and its SwiftUI graph unless it was reopened in the meantime.
+                if let window = self.dashboardWindow, !window.isVisible {
+                    window.delegate = nil
+                    window.contentViewController = nil
+                    self.dashboardWindow = nil
+                }
                 self.updateActiveState()
             }
         }

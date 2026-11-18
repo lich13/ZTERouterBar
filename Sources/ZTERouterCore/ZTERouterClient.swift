@@ -75,6 +75,8 @@ public actor ZTERouterClient {
     private var cachedWaInnerVersion: String = ""
     private var cachedCrVersion: String = ""
     private var lastKeepAliveAt: Date?
+    /// Cleared if a firmware turns out not to report `loginfo` inside the merged status query.
+    private var statusQueryReportsLogin = true
 
     public init(
         config: RouterEndpointConfig,
@@ -84,16 +86,6 @@ public actor ZTERouterClient {
         self.config = config
         self.password = password
         self.transport = transport
-    }
-
-    public func updateCredentials(config: RouterEndpointConfig, password: String) {
-        if self.config.baseURL != config.baseURL {
-            self.cachedWaInnerVersion = ""
-            self.cachedCrVersion = ""
-            self.lastKeepAliveAt = nil
-        }
-        self.config = config
-        self.password = password
     }
 
     // MARK: - Auth & Session
@@ -220,19 +212,39 @@ public actor ZTERouterClient {
         reclaimIfDuplicate: Bool = false,
         includeStationLists: Bool = true
     ) async throws -> RouterStatusSnapshot {
-        try await ensureAuthenticated(reclaimIfDuplicate: reclaimIfDuplicate)
-        await keepAliveIfNeeded()
+        if !statusQueryReportsLogin {
+            try await ensureAuthenticated(reclaimIfDuplicate: reclaimIfDuplicate)
+        }
 
-        var snapshot = try await fetchSnapshotOnce(includeStationLists: includeStationLists)
+        var status = try await fetchStatusObject()
+        var snapshot = RouterStatusParser.parse(jsonObjects: [status])
 
-        // If the session was kicked out between `checkLoggedIn()` and `fetchSnapshotOnce()`,
-        // ZTE returns HTTP 200 with empty protected fields. Re-authenticate once and retry.
-        if snapshot.isUnauthenticatedEmptySnapshot {
+        // A kicked-out session answers HTTP 200 with `loginfo` unset and empty protected fields.
+        if (statusQueryReportsLogin && !Self.reportsLoggedIn(status)) || snapshot.isUnauthenticatedEmptySnapshot {
             try await login(reclaimIfDuplicate: reclaimIfDuplicate)
-            snapshot = try await fetchSnapshotOnce(includeStationLists: includeStationLists)
+            status = try await fetchStatusObject()
+            snapshot = RouterStatusParser.parse(jsonObjects: [status])
             if snapshot.isUnauthenticatedEmptySnapshot {
                 throw ZTERouterError.sessionExpired
             }
+            if !Self.reportsLoggedIn(status) {
+                // Logged in and getting data, yet `loginfo` is not "ok" here: stop trusting it,
+                // otherwise every poll would log in again.
+                statusQueryReportsLogin = false
+            }
+        }
+        await keepAliveIfNeeded()
+
+        if includeStationLists {
+            // ZTE firmware returns array JSON for `station_list` and `lan_station_list` only when queried individually without `multi_data=1`.
+            var objects = [status]
+            for cmd in ["station_list", "lan_station_list"] {
+                if let data = try? await getRawData([cmd]),
+                   let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                    objects.append(object)
+                }
+            }
+            snapshot = RouterStatusParser.parse(jsonObjects: objects)
         }
 
         if !snapshot.versionInfo.waInnerVersion.isEmpty {
@@ -242,22 +254,16 @@ public actor ZTERouterClient {
         return snapshot
     }
 
-    private func fetchSnapshotOnce(includeStationLists: Bool) async throws -> RouterStatusSnapshot {
-        let data1 = try await getRawData(RouterStatusParser.primarySignalCmds)
-        let data2 = try await getRawData(RouterStatusParser.secondaryDashboardCmds)
-        var payloads = [data1, data2]
-
-        if includeStationLists {
-            // ZTE firmware returns array JSON for `station_list` and `lan_station_list` only when queried individually without `multi_data=1`.
-            if let wifiStationsData = try? await getRawData(["station_list"]) {
-                payloads.append(wifiStationsData)
-            }
-            if let lanStationsData = try? await getRawData(["lan_station_list"]) {
-                payloads.append(lanStationsData)
-            }
+    private func fetchStatusObject() async throws -> [String: Any] {
+        let data = try await getRawData(RouterStatusParser.statusCmds)
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw ZTERouterError.invalidResponse("非 JSON 对象")
         }
+        return object
+    }
 
-        return try RouterStatusParser.parse(jsonDataList: payloads)
+    private static func reportsLoggedIn(_ status: [String: Any]) -> Bool {
+        (status["loginfo"] as? String)?.lowercased() == "ok"
     }
 
     // MARK: - One-Click WAN Reconnect

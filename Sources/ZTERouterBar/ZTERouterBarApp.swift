@@ -21,6 +21,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    @objc private func quitByUser() {
+        viewModel.noteUserQuit()
+        NSApp.terminate(nil)
+    }
+
     private func setupMainMenu() {
         let mainMenu = NSMenu()
 
@@ -28,7 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "退出 ZTERouterBar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quitItem = appMenu.addItem(withTitle: "退出 ZTERouterBar", action: #selector(quitByUser), keyEquivalent: "q")
+        quitItem.target = self
         appMenuItem.submenu = appMenu
 
         // Edit menu (enables Cmd+C/V/X/A in TextField & SecureField)
@@ -60,6 +66,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct ZTERouterBarEntry {
     @MainActor
     static func main() {
+        if CommandLine.arguments.contains(WiFiLaunchAgent.triggerArgument) {
+            WiFiLaunchAgent.runTrigger()
+        }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate

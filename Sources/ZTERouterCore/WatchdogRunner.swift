@@ -69,6 +69,9 @@ public struct WatchdogRunner: Sendable {
         }
     }
 
+    /// Monitoring -> confirming (sustained failure window) -> reconnecting -> settling (grace) -> monitoring.
+    /// A reconnect needs `failureWindowSec` of uninterrupted failure, and every reconnect is followed by a
+    /// quiet period, so back-to-back redials are impossible by construction.
     public func run(
         config rawConfig: WatchdogConfig,
         prober: any EndpointProbing,
@@ -87,7 +90,7 @@ public struct WatchdogRunner: Sendable {
         let summaryDesc = endpoints.map { "\($0.displayTitle)(\($0.intervalSec)s/\($0.timeoutSec)s)" }.joined(separator: "、")
         await onEvent(.log(WatchdogLogEntry(
             level: .info,
-            message: "保活守护启动：\(summaryDesc)，连续 \(config.recheckBeforeAct + 1) 次异常重连（复检 \(config.recheckBeforeAct) 次 · 间隔 \(config.recheckIntervalSec)s）"
+            message: "保活守护启动：\(summaryDesc)，持续异常 \(config.failureWindowSec)s 才重连（确认期每 \(config.recheckIntervalSec)s 复检），重连后保护 \(config.postReconnectGraceSec)s"
         )))
         await onEvent(.phaseChanged(.monitoring))
 
@@ -96,198 +99,140 @@ public struct WatchdogRunner: Sendable {
         var nextDueSec: [UUID: Int] = Dictionary(uniqueKeysWithValues: endpoints.map { ($0.id, 0) })
         var timelineSec = 0
 
-        while !Task.isCancelled {
-            do {
+        do {
+            while true {
+                try Task.checkCancellation()
+
+                // Monitoring: probe whichever endpoints are due on their own interval.
                 let dueEndpoints = endpoints.filter { (nextDueSec[$0.id] ?? 0) <= timelineSec }
-                if !dueEndpoints.isEmpty {
-                    let batch = await probeAll(endpoints: dueEndpoints, prober: prober)
-                    for outcome in batch {
-                        latestByID[outcome.id] = outcome
-                    }
-                    for ep in dueEndpoints {
-                        nextDueSec[ep.id] = timelineSec + ep.intervalSec
-                    }
+                guard !dueEndpoints.isEmpty else {
+                    try await sleepUntilNextDue(endpoints: endpoints, nextDueSec: nextDueSec, timelineSec: &timelineSec)
+                    continue
+                }
+                let batch = await probeAll(endpoints: dueEndpoints, prober: prober)
+                for outcome in batch { latestByID[outcome.id] = outcome }
+                for ep in dueEndpoints { nextDueSec[ep.id] = timelineSec + ep.intervalSec }
 
-                    let snapshotOutcomes = endpoints.compactMap { latestByID[$0.id] }
-                    let healthy = WatchdogEvaluator.isHealthy(outcomes: snapshotOutcomes, policy: config.triggerPolicy)
-                    await logRound(
-                        snapshotOutcomes: snapshotOutcomes,
-                        probedOutcomes: batch,
-                        policy: config.triggerPolicy,
-                        healthy: healthy,
-                        onEvent: onEvent
-                    )
+                let latest = endpoints.compactMap { latestByID[$0.id] }
+                let healthy = WatchdogEvaluator.isHealthy(outcomes: latest, policy: config.triggerPolicy)
+                await logRound(snapshotOutcomes: latest, probedOutcomes: batch, policy: config.triggerPolicy, healthy: healthy, onEvent: onEvent)
+                if healthy {
+                    consecutiveReconnects = 0
+                    await onEvent(.phaseChanged(.monitoring))
+                    continue
+                }
 
-                    if healthy {
-                        consecutiveReconnects = 0
-                        await onEvent(.phaseChanged(.monitoring))
-                        try await sleepUntilNextDue(endpoints: endpoints, nextDueSec: nextDueSec, timelineSec: &timelineSec)
-                        continue
-                    }
+                // Confirming: every round re-probes all endpoints; one healthy round cancels the reconnect.
+                await onEvent(.log(WatchdogLogEntry(
+                    level: .warning,
+                    message: "探测异常，进入确认期：持续异常满 \(config.failureWindowSec)s 才重连（每 \(config.recheckIntervalSec)s 复检）"
+                )))
+                var failingSec = 0
+                var recovered = false
+                while failingSec < config.failureWindowSec {
+                    await onEvent(.phaseChanged(.confirming(elapsedSec: failingSec, windowSec: config.failureWindowSec)))
+                    try await sleep(.seconds(config.recheckIntervalSec))
+                    timelineSec += config.recheckIntervalSec
 
-                    // Jitter recheck loop: always probe all enabled endpoints for fresh verification.
-                    var confirmedDown = true
-                    if config.recheckBeforeAct > 0 {
+                    let recheck = await probeAll(endpoints: endpoints, prober: prober)
+                    for outcome in recheck { latestByID[outcome.id] = outcome }
+                    for ep in endpoints { nextDueSec[ep.id] = timelineSec + ep.intervalSec }
+
+                    recovered = WatchdogEvaluator.isHealthy(outcomes: recheck, policy: config.triggerPolicy)
+                    await logRound(snapshotOutcomes: recheck, probedOutcomes: recheck, policy: config.triggerPolicy, healthy: recovered, onEvent: onEvent)
+                    if recovered { break }
+                    // A round lasts its recheck pause plus its slowest probe (probes run in parallel).
+                    failingSec += config.recheckIntervalSec + (recheck.map(\.elapsedMs).max() ?? 0) / 1000
+                }
+                if recovered {
+                    consecutiveReconnects = 0
+                    await onEvent(.log(WatchdogLogEntry(level: .success, message: "确认期内恢复通畅，判定为瞬时抖动，不重连")))
+                    await onEvent(.phaseChanged(.monitoring))
+                    continue
+                }
+
+                // Reconnecting.
+                if let pauseReason = await canReconnect?() {
+                    await onEvent(.phaseChanged(.paused(reason: pauseReason)))
+                    await onEvent(.log(WatchdogLogEntry(level: .warning, message: "暂停重连：\(pauseReason)")))
+                    try await pause(seconds: endpoints.map(\.intervalSec).min() ?? 15, endpoints: endpoints, nextDueSec: &nextDueSec, timelineSec: &timelineSec)
+                    continue
+                }
+
+                let triggerReason = "持续 \(failingSec)s 检测不可达"
+                await onEvent(.phaseChanged(.reconnecting))
+                await onEvent(.autoReconnectTriggered(reason: triggerReason))
+                await onEvent(.log(WatchdogLogEntry(level: .warning, message: "\(triggerReason)，正在触发路由器外网重连…")))
+
+                do {
+                    let newState = try await router.reconnectInternet()
+                    await onEvent(.autoReconnectFinished(state: newState))
+                    if !newState.isConnected {
                         await onEvent(.log(WatchdogLogEntry(
                             level: .warning,
-                            message: "探测异常，开始防抖复检（\(config.recheckBeforeAct) 次，间隔 \(config.recheckIntervalSec)s）…"
+                            message: "重连指令已执行，但状态尚未确认在线（\(newState.localizedLabel)）"
                         )))
-                        for attempt in 1...config.recheckBeforeAct {
-                            await onEvent(.phaseChanged(.rechecking(attempt: attempt, total: config.recheckBeforeAct)))
-                            try await sleep(.seconds(config.recheckIntervalSec))
-                            timelineSec += config.recheckIntervalSec
-
-                            let recheck = await probeAll(endpoints: endpoints, prober: prober)
-                            for outcome in recheck { latestByID[outcome.id] = outcome }
-                            for ep in endpoints { nextDueSec[ep.id] = timelineSec + ep.intervalSec }
-
-                            let recovered = WatchdogEvaluator.isHealthy(outcomes: recheck, policy: config.triggerPolicy)
-                            await logRound(
-                                snapshotOutcomes: recheck,
-                                probedOutcomes: recheck,
-                                policy: config.triggerPolicy,
-                                healthy: recovered,
-                                onEvent: onEvent
-                            )
-                            if recovered {
-                                confirmedDown = false
-                                await onEvent(.log(WatchdogLogEntry(
-                                    level: .success,
-                                    message: "复检第 \(attempt) 次恢复通畅，判定为瞬时抖动，不重连"
-                                )))
-                                break
-                            }
-                        }
                     }
-
-                    if !confirmedDown {
-                        consecutiveReconnects = 0
-                        await onEvent(.phaseChanged(.monitoring))
-                        try await sleepUntilNextDue(endpoints: endpoints, nextDueSec: nextDueSec, timelineSec: &timelineSec)
+                } catch let routerError as ZTERouterError {
+                    switch routerError {
+                    case .duplicateUser, .wrongPassword, .loginRateLimited, .missingPassword, .sessionExpired:
+                        // Retrying cannot help until the user fixes the session or credentials.
+                        let reason = routerError.localizedDescription
+                        await onEvent(.phaseChanged(.paused(reason: reason)))
+                        await onEvent(.log(WatchdogLogEntry(level: .error, message: "无法执行重连：\(reason)")))
+                        try await pause(seconds: max(endpoints.map(\.intervalSec).min() ?? 20, 20), endpoints: endpoints, nextDueSec: &nextDueSec, timelineSec: &timelineSec)
                         continue
+                    default:
+                        await onEvent(.log(WatchdogLogEntry(level: .error, message: "路由器重连异常：\(routerError.localizedDescription)")))
                     }
-
-                    // Confirmed unreachable -> execute reconnect + post-reconnect verification loop.
-                    reconnectLoop: while !Task.isCancelled {
-                        if let pauseReason = await canReconnect?() {
-                            await onEvent(.phaseChanged(.paused(reason: pauseReason)))
-                            await onEvent(.log(WatchdogLogEntry(level: .warning, message: "暂停重连：\(pauseReason)")))
-                            let waitSec = endpoints.map(\.intervalSec).min() ?? 15
-                            try await sleep(.seconds(waitSec))
-                            timelineSec += waitSec
-                            for ep in endpoints { nextDueSec[ep.id] = timelineSec }
-                            break reconnectLoop
-                        }
-
-                        let triggerReason = "连续 \(config.recheckBeforeAct + 1) 次检测不可达"
-                        await onEvent(.phaseChanged(.reconnecting))
-                        await onEvent(.autoReconnectTriggered(reason: triggerReason))
-                        await onEvent(.log(WatchdogLogEntry(level: .warning, message: "\(triggerReason)，正在触发路由器外网重连…")))
-
-                        do {
-                            let newState = try await router.reconnectInternet()
-                            await onEvent(.autoReconnectFinished(state: newState))
-                            if !newState.isConnected {
-                                await onEvent(.log(WatchdogLogEntry(
-                                    level: .warning,
-                                    message: "重连指令已执行，但状态尚未确认在线（\(newState.localizedLabel)）"
-                                )))
-                            }
-                        } catch let routerError as ZTERouterError {
-                            switch routerError {
-                            case .duplicateUser, .wrongPassword, .loginRateLimited, .missingPassword, .sessionExpired:
-                                let reason = routerError.localizedDescription
-                                await onEvent(.phaseChanged(.paused(reason: reason)))
-                                await onEvent(.log(WatchdogLogEntry(level: .error, message: "无法执行重连：\(reason)")))
-                                let waitSec = max(endpoints.map(\.intervalSec).min() ?? 20, 20)
-                                try await sleep(.seconds(waitSec))
-                                timelineSec += waitSec
-                                for ep in endpoints { nextDueSec[ep.id] = timelineSec }
-                                break reconnectLoop
-                            default:
-                                await onEvent(.log(WatchdogLogEntry(
-                                    level: .error,
-                                    message: "路由器重连异常：\(routerError.localizedDescription)"
-                                )))
-                                try await sleep(.seconds(config.recheckIntervalSec))
-                                timelineSec += config.recheckIntervalSec
-                                continue reconnectLoop
-                            }
-                        } catch is CancellationError {
-                            throw CancellationError()
-                        } catch {
-                            await onEvent(.log(WatchdogLogEntry(level: .error, message: "重连异常：\(error.localizedDescription)")))
-                            try await sleep(.seconds(config.recheckIntervalSec))
-                            timelineSec += config.recheckIntervalSec
-                            continue reconnectLoop
-                        }
-
-                        await onEvent(.phaseChanged(.verifyingAfterReconnect))
-                        await onEvent(.log(WatchdogLogEntry(
-                            level: .info,
-                            message: "外网重连完成，等待 \(config.recheckIntervalSec)s 后执行连通性复检…"
-                        )))
-                        try await sleep(.seconds(config.recheckIntervalSec))
-                        timelineSec += config.recheckIntervalSec
-
-                        let postCheck = await probeAll(endpoints: endpoints, prober: prober)
-                        for outcome in postCheck { latestByID[outcome.id] = outcome }
-                        for ep in endpoints { nextDueSec[ep.id] = timelineSec + ep.intervalSec }
-
-                        let postHealthy = WatchdogEvaluator.isHealthy(outcomes: postCheck, policy: config.triggerPolicy)
-                        await logRound(
-                            snapshotOutcomes: postCheck,
-                            probedOutcomes: postCheck,
-                            policy: config.triggerPolicy,
-                            healthy: postHealthy,
-                            onEvent: onEvent
-                        )
-
-                        if postHealthy {
-                            consecutiveReconnects = 0
-                            await onEvent(.log(WatchdogLogEntry(level: .success, message: "重连后复检通过，外网已恢复畅通")))
-                            await onEvent(.phaseChanged(.monitoring))
-                            break reconnectLoop
-                        }
-
-                        consecutiveReconnects += 1
-                        if consecutiveReconnects >= config.maxConsecutiveReconnects {
-                            await onEvent(.phaseChanged(.coolingDown(seconds: config.cooldownSec)))
-                            await onEvent(.log(WatchdogLogEntry(
-                                level: .error,
-                                message: "连续 \(consecutiveReconnects) 次重连后仍不可达，进入 \(config.cooldownSec)s 冷却期"
-                            )))
-                            consecutiveReconnects = 0
-                            try await sleep(.seconds(config.cooldownSec))
-                            timelineSec += config.cooldownSec
-                            for ep in endpoints { nextDueSec[ep.id] = timelineSec }
-                            await onEvent(.phaseChanged(.monitoring))
-                            break reconnectLoop
-                        } else {
-                            await onEvent(.log(WatchdogLogEntry(
-                                level: .warning,
-                                message: "重连后复检仍不可达（第 \(consecutiveReconnects)/\(config.maxConsecutiveReconnects) 次），准备再次重连…"
-                            )))
-                        }
-                    }
-
-                    if !Task.isCancelled {
-                        try await sleepUntilNextDue(endpoints: endpoints, nextDueSec: nextDueSec, timelineSec: &timelineSec)
-                    }
-                } else {
-                    try await sleepUntilNextDue(endpoints: endpoints, nextDueSec: nextDueSec, timelineSec: &timelineSec)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    await onEvent(.log(WatchdogLogEntry(level: .error, message: "重连异常：\(error.localizedDescription)")))
                 }
-            } catch is CancellationError {
-                break
-            } catch {
-                await onEvent(.log(WatchdogLogEntry(level: .error, message: "守护循环异常：\(error.localizedDescription)")))
-                try? await sleep(.seconds(config.recheckIntervalSec))
-                timelineSec += config.recheckIntervalSec
+
+                // Settling: stay silent while the new link (and anything riding on it) comes back up.
+                consecutiveReconnects += 1
+                if consecutiveReconnects >= config.maxConsecutiveReconnects {
+                    let cooldownSec = max(config.cooldownSec, config.postReconnectGraceSec)
+                    await onEvent(.phaseChanged(.coolingDown(seconds: cooldownSec)))
+                    await onEvent(.log(WatchdogLogEntry(
+                        level: .error,
+                        message: "已连续重连 \(consecutiveReconnects) 次且期间未见恢复，冷却 \(cooldownSec)s 后再继续监测"
+                    )))
+                    consecutiveReconnects = 0
+                    try await pause(seconds: cooldownSec, endpoints: endpoints, nextDueSec: &nextDueSec, timelineSec: &timelineSec)
+                } else {
+                    await onEvent(.phaseChanged(.settling(seconds: config.postReconnectGraceSec)))
+                    await onEvent(.log(WatchdogLogEntry(
+                        level: .info,
+                        message: "重连完成，进入 \(config.postReconnectGraceSec)s 保护期（期间不探测、不重连）"
+                    )))
+                    try await pause(seconds: config.postReconnectGraceSec, endpoints: endpoints, nextDueSec: &nextDueSec, timelineSec: &timelineSec)
+                }
+                latestByID.removeAll()
+                await onEvent(.phaseChanged(.monitoring))
             }
+        } catch {
+            // Cancellation (or a failing injected sleep) ends the watchdog.
         }
 
         await onEvent(.phaseChanged(.idle))
         await onEvent(.log(WatchdogLogEntry(level: .info, message: "保活守护已停止")))
+    }
+
+    /// Sleeps, then makes every endpoint due so the next monitoring round is a full fresh probe.
+    private func pause(
+        seconds: Int,
+        endpoints: [WatchdogEndpoint],
+        nextDueSec: inout [UUID: Int],
+        timelineSec: inout Int
+    ) async throws {
+        if seconds > 0 {
+            try await sleep(.seconds(seconds))
+        }
+        timelineSec += seconds
+        for ep in endpoints { nextDueSec[ep.id] = timelineSec }
     }
 
     private func sleepUntilNextDue(
