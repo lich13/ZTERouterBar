@@ -182,8 +182,10 @@ internal class MockRouterTransport(
         loggedIn = false
     }
 
+    override suspend fun send(request: RouterHttpRequest): RouterHttpResponse = handleSync(request)
+
     @Synchronized
-    override suspend fun send(request: RouterHttpRequest): RouterHttpResponse {
+    private fun handleSync(request: RouterHttpRequest): RouterHttpResponse {
         capturedRequests.add(request)
         if (request.method == "GET") {
             if (request.url.contains("/tmpl/network/apn_setting.html")) {
