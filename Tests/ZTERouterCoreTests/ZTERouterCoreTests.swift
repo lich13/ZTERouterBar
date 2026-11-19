@@ -734,6 +734,218 @@ struct ZTERouterCoreTests {
         #expect(URLEndpointProber.failureMessage(forStatusCode: 503) != nil)
         #expect(URLEndpointProber.failureMessage(forStatusCode: 504) != nil)
     }
+
+    @Test("Keychain OSStatus classification distinguishes DarkWake deferral from user denial and missing item")
+    func testKeychainLoadResultClassification() {
+        #expect(KeychainLoadResult.classify(status: 0, password: "pw") == .found("pw"))
+        #expect(KeychainLoadResult.classify(status: 0, password: "") == .notFound)
+        #expect(KeychainLoadResult.classify(status: 0, password: nil) == .notFound)
+        #expect(KeychainLoadResult.classify(status: -25_300, password: nil) == .notFound)
+
+        #expect(KeychainLoadResult.classify(status: -2_147_415_834, password: nil) == .deferredBySystem(-2_147_415_834))
+        #expect(KeychainLoadResult.classify(status: -25_308, password: nil) == .deferredBySystem(-25_308))
+        #expect(KeychainLoadResult.classify(status: -25_315, password: nil) == .deferredBySystem(-25_315))
+
+        #expect(KeychainLoadResult.classify(status: -128, password: nil) == .deniedOrFailed(-128))
+        #expect(KeychainLoadResult.classify(status: -25_293, password: nil) == .deniedOrFailed(-25_293))
+        #expect(KeychainLoadResult.classify(status: -50, password: nil) == .deniedOrFailed(-50))
+    }
+
+    @Test("Denied Keychain item keeps hasStoredPassword=true and never auto-retries until explicit user retry")
+    func testKeychainDeniedStateNeverAutoRetries() {
+        let p1 = UUID()
+        let p2 = UUID()
+        var callCounts: [UUID: Int] = [:]
+        var allowP1 = false
+        let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+
+        var sm = ProfileCredentialStateMachine()
+        let (firstEval, firstDiag) = sm.loadActiveProfile(id: p1, isInteractiveGUI: true, now: t0) { id in
+            callCounts[id, default: 0] += 1
+            return allowP1 ? .found("unlocked-pw") : .deniedOrFailed(-128)
+        }
+        #expect(firstEval.hasStoredPassword == true)
+        #expect(firstEval.isCredentialReady == false)
+        #expect(firstEval.issue == .deniedOrFailed(status: -128))
+        #expect(firstDiag?.contains("-128") == true)
+        #expect(callCounts[p1] == 1)
+
+        // Even 60s later in active GUI, neither loadActiveProfile nor preloadAllProfilesIfNeeded retries p1.
+        allowP1 = true
+        let (secondEval, _) = sm.loadActiveProfile(id: p1, isInteractiveGUI: true, now: t0.addingTimeInterval(60)) { id in
+            callCounts[id, default: 0] += 1
+            return .found("unlocked-pw")
+        }
+        #expect(secondEval.isCredentialReady == false)
+        #expect(callCounts[p1] == 1)
+
+        _ = sm.preloadAllProfilesIfNeeded(profileIDs: [p1, p2], isInteractiveGUI: true, now: t0.addingTimeInterval(65)) { id in
+            callCounts[id, default: 0] += 1
+            return id == p1 ? .found("unlocked-pw") : .found("pw-2")
+        }
+        #expect(callCounts[p1] == 1)
+        #expect(callCounts[p2] == 1)
+
+        // Explicit user retry unlocks p1 immediately.
+        let (explicitEval, _) = sm.loadActiveProfile(
+            id: p1,
+            isInteractiveGUI: true,
+            userInitiatedRetry: true,
+            now: t0.addingTimeInterval(66)
+        ) { id in
+            callCounts[id, default: 0] += 1
+            return .found("unlocked-pw")
+        }
+        #expect(explicitEval.isCredentialReady == true)
+        #expect(explicitEval.password == "unlocked-pw")
+        #expect(explicitEval.issue == nil)
+        #expect(callCounts[p1] == 2)
+    }
+
+    @Test("DarkWake init deferral skips non-GUI retries, respects 3s cooldown, and preloads all profiles on GUI wake")
+    func testDarkWakeInitDeferralAndGUIPreload() {
+        let pDefault = UUID()
+        let pPocket = UUID()
+        var calls: [UUID: Int] = [:]
+        let t0 = Date(timeIntervalSince1970: 1_700_001_000)
+
+        var sm = ProfileCredentialStateMachine(initialSSID: "Home_CPE")
+        // Cold start in DarkWake (`wifiOnlyLaunch`): active profile returns CSSMERR_CSP_IN_DARK_WAKE.
+        let (darkEval, diag) = sm.loadActiveProfile(id: pDefault, isInteractiveGUI: false, now: t0) { id in
+            calls[id, default: 0] += 1
+            return .deferredBySystem(-2_147_415_834)
+        }
+        sm.noteWatchdogPausedForDeferredCredential(wasRunning: false, autoStart: true, userStoppedWatchdog: false)
+
+        #expect(darkEval.hasStoredPassword == true)
+        #expect(darkEval.isCredentialReady == false)
+        #expect(darkEval.issue == .deferredBySystem(status: -2_147_415_834))
+        #expect(diag?.contains("-2147415834") == true)
+        #expect(sm.watchdogPausedBySystem == true)
+        #expect(sm.hasPreloadedAllProfilesInGUI == false)
+        #expect(calls[pDefault] == 1)
+        #expect(calls[pPocket, default: 0] == 0)
+
+        // Non-GUI event 10s later does not touch Keychain.
+        _ = sm.loadActiveProfile(id: pDefault, isInteractiveGUI: false, now: t0.addingTimeInterval(10)) { id in
+            calls[id, default: 0] += 1
+            return .found("should-not-run")
+        }
+        #expect(calls[pDefault] == 1)
+
+        // GUI wake at t0 + 1s: preloads pPocket, while pDefault is still inside the 3s per-profile retry cooldown.
+        _ = sm.preloadAllProfilesIfNeeded(profileIDs: [pDefault, pPocket], isInteractiveGUI: true, now: t0.addingTimeInterval(1.0)) { id in
+            calls[id, default: 0] += 1
+            return .found("pw-\(id.uuidString.prefix(4))")
+        }
+        #expect(calls[pPocket] == 1)
+        #expect(calls[pDefault] == 1)
+        #expect(sm.hasPreloadedAllProfilesInGUI == false)
+
+        // At t0 + 3.2s, cooldown expires and pDefault unlocks; watchdog resumes cleanly.
+        _ = sm.preloadAllProfilesIfNeeded(profileIDs: [pDefault, pPocket], isInteractiveGUI: true, now: t0.addingTimeInterval(3.2)) { id in
+            calls[id, default: 0] += 1
+            return .found("pw-default")
+        }
+        let (readyEval, _) = sm.loadActiveProfile(id: pDefault, isInteractiveGUI: true, now: t0.addingTimeInterval(3.2)) { _ in
+            Issue.record("Expected memory cache hit after GUI preload")
+            return .notFound
+        }
+        #expect(readyEval.password == "pw-default")
+        #expect(sm.hasPreloadedAllProfilesInGUI == true)
+        #expect(sm.shouldResumeWatchdog(isCredentialReady: true, isWatchdogRunning: false, autoStart: true, userStoppedWatchdog: false) == true)
+    }
+
+    @Test("Manually started watchdog with autoStart=false resumes after system sleep, while user-stopped watchdog stays off")
+    func testWatchdogPausedBySystemResumesWhenAutoStartOff() {
+        var sm = ProfileCredentialStateMachine(initialSSID: "Pocket_5G")
+        // User manually started watchdog while autoStart == false.
+        sm.noteWatchdogStarted()
+        sm.noteSystemWillSleep(currentSSID: "Pocket_5G", isWatchdogRunning: true)
+        #expect(sm.watchdogPausedBySystem == true)
+        #expect(sm.isSystemSleeping == true)
+        #expect(sm.shouldResumeWatchdog(isCredentialReady: true, isWatchdogRunning: false, autoStart: false, userStoppedWatchdog: false) == false)
+
+        sm.noteSystemDidWake(currentSSID: "Pocket_5G")
+        #expect(sm.isSystemSleeping == false)
+        #expect(sm.shouldResumeWatchdog(isCredentialReady: true, isWatchdogRunning: false, autoStart: false, userStoppedWatchdog: false) == true)
+
+        sm.noteWatchdogStarted()
+        #expect(sm.watchdogPausedBySystem == false)
+
+        // Now user explicitly stops watchdog before next sleep -> stays off on wake.
+        sm.noteUserStoppedWatchdog()
+        sm.noteSystemWillSleep(currentSSID: "Pocket_5G", isWatchdogRunning: false)
+        sm.noteSystemDidWake(currentSSID: "Pocket_5G")
+        #expect(sm.shouldResumeWatchdog(isCredentialReady: true, isWatchdogRunning: false, autoStart: false, userStoppedWatchdog: true) == false)
+        #expect(sm.shouldResumeWatchdog(isCredentialReady: true, isWatchdogRunning: false, autoStart: true, userStoppedWatchdog: true) == false)
+    }
+
+    @Test("needsSessionReclaim is preserved across early DHCP transportError, triggered on awake rejoin, and never set on wake")
+    func testSessionReclaimScopingAndTransportRetry() {
+        let p1 = UUID()
+        let p2 = UUID()
+        let t0 = Date(timeIntervalSince1970: 1_700_002_000)
+
+        var sm = ProfileCredentialStateMachine(initialSSID: "Pocket_5G")
+        // Cold start allows initial reclaim; early DHCP transportError preserves it for the next poll.
+        #expect(sm.effectiveReclaimFlag(silentPoll: true) == true)
+        sm.noteRouterInteractionResult(error: .transportError("No route to host"))
+        #expect(sm.effectiveReclaimFlag(silentPoll: true) == true)
+
+        // First HTTP response clears needsSessionReclaim.
+        sm.noteRouterInteractionResult(error: nil)
+        #expect(sm.effectiveReclaimFlag(silentPoll: true) == false)
+
+        // System sleep -> link drops -> wakes on SAME SSID within wake grace: P1 refreshes, but NEVER sets needsSessionReclaim.
+        sm.noteSystemWillSleep(currentSSID: "Pocket_5G", isWatchdogRunning: true)
+        _ = sm.noteSSIDChanged(nil, matchedProfileID: nil, activeProfileID: p1, autoMatchEnabled: true, now: t0)
+        sm.noteSystemDidWake(currentSSID: nil, now: t0.addingTimeInterval(2))
+        let wakeRejoin = sm.noteSSIDChanged("Pocket_5G", matchedProfileID: p1, activeProfileID: p1, autoMatchEnabled: true, now: t0.addingTimeInterval(4))
+        #expect(wakeRejoin.shouldRefreshSameProfile == true)
+        #expect(wakeRejoin.shouldSelectProfileID == nil)
+        #expect(sm.effectiveReclaimFlag(silentPoll: true) == false)
+
+        // Awake Wi-Fi drop and reconnect to same profile (P1 while awake): refreshes AND enables one reclaim.
+        _ = sm.noteSSIDChanged(nil, matchedProfileID: nil, activeProfileID: p1, autoMatchEnabled: true, now: t0.addingTimeInterval(30))
+        let awakeRejoin = sm.noteSSIDChanged("Pocket_5G", matchedProfileID: p1, activeProfileID: p1, autoMatchEnabled: true, now: t0.addingTimeInterval(35))
+        #expect(awakeRejoin.shouldRefreshSameProfile == true)
+        #expect(sm.effectiveReclaimFlag(silentPoll: true) == true)
+        sm.noteRouterInteractionResult(error: .duplicateUser)
+        #expect(sm.effectiveReclaimFlag(silentPoll: true) == false)
+
+        // Switching to another profile sets needsSessionReclaim.
+        let switchDecision = sm.noteSSIDChanged("Home_CPE", matchedProfileID: p2, activeProfileID: p1, autoMatchEnabled: true, now: t0.addingTimeInterval(40))
+        #expect(switchDecision.shouldSelectProfileID == p2)
+        #expect(sm.effectiveReclaimFlag(silentPoll: true) == true)
+    }
+
+    @Test("Watchdog clamps anomalous cross-sleep probe elapsedMs to endpoint timeout ceiling")
+    func testWatchdogClampsCrossSleepProbeDuration() async {
+        // Simulate a socket stall reporting 833_448ms on round 2 (as observed at 08:33:03 across sleep).
+        // With timeoutSec=4 and recheckIntervalSec=5, round 2 may only advance failingSec by 5 + 4 = 9s (not 838s!),
+        // so recovering on round 3 cancels reconnect cleanly without false trigger.
+        let prober = ScriptedProber(roundResults: [false, false, true], elapsedMs: 833_448)
+        let router = MockReconnectRouter()
+        var cfg = WatchdogConfig(autoReconnectEnabled: true, failureWindowSec: 60, recheckIntervalSec: 5)
+        cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid", timeoutSec: 4)]
+
+        let collector = PhaseCollector()
+        let task = Task {
+            await WatchdogRunner(sleep: Self.fastSleep).run(config: cfg, prober: prober, router: router) { event in
+                await collector.record(event)
+            }
+        }
+        await Self.waitUntil { await prober.completedRounds >= 4 }
+        task.cancel()
+        await task.value
+
+        #expect(await router.reconnectCount == 0)
+        let phases = await collector.phases
+        #expect(phases.contains(.confirming(elapsedSec: 0, windowSec: 60)))
+        #expect(phases.contains(.confirming(elapsedSec: 9, windowSec: 60)))
+        #expect(!phases.contains(.reconnecting))
+    }
 }
 
 private actor EndpointCallCounter {

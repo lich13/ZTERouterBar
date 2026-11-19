@@ -110,7 +110,7 @@ struct DashboardView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(isConnected ? .blue : .green)
-            .disabled(viewModel.isReconnectingWAN || !viewModel.hasStoredPassword)
+            .disabled(viewModel.isReconnectingWAN || !viewModel.isCredentialReady)
 
             Button {
                 Task { await viewModel.refreshNow(silent: false) }
@@ -180,6 +180,22 @@ private struct SignalOverviewTab: View {
                     stationsCard(snap: snap)
                 }
                 .padding(16)
+            } else if let issue = viewModel.activeCredentialIssue {
+                ContentUnavailableView {
+                    Label("需读取钥匙串中的管理密码", systemImage: "key.fill")
+                } description: {
+                    Text(
+                        issue.isSystemDeferred
+                            ? "上次读取因系统非交互态延后（状态码 \(issue.statusCode)）。版本更新后首次读取可能弹出系统授权框，建议选择「始终允许」。"
+                            : "上次钥匙串授权未通过（状态码 \(issue.statusCode)）。请点击下方按钮重新授权读取，或在「配置与设置」中重设密码。"
+                    )
+                } actions: {
+                    Button("立即读取密码") {
+                        viewModel.retryUnlockKeychainFromUserAction()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding(40)
             } else {
                 ContentUnavailableView(
                     "暂无路由器状态数据",

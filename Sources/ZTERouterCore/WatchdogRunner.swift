@@ -70,7 +70,11 @@ extension WatchdogEvaluator {
 public struct WatchdogRunner: Sendable {
     private let sleep: @Sendable (Duration) async throws -> Void
 
-    public init(sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
+    public init(
+        sleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0, clock: .suspending)
+        }
+    ) {
         self.sleep = sleep
     }
 
@@ -175,8 +179,11 @@ public struct WatchdogRunner: Sendable {
                         notifiedThisOutage = true
                         await onEvent(.probeFailureDetected(reason: "连续 2 次探测不通"))
                     }
-                    // A round lasts its recheck pause plus its slowest probe (probes run in parallel).
-                    failingSec += config.recheckIntervalSec + (recheck.map(\.elapsedMs).max() ?? 0) / 1000
+                    // A round lasts its recheck pause plus its slowest probe (clamped to max endpoint timeout
+                    // so any cross-sleep socket stall can never inflate a single round across the whole window).
+                    let maxTimeoutSec = max(1, endpoints.map(\.timeoutSec).max() ?? 10)
+                    let probeSec = min(max(0, (recheck.map(\.elapsedMs).max() ?? 0) / 1000), maxTimeoutSec)
+                    failingSec += config.recheckIntervalSec + probeSec
                 }
                 if recovered {
                     consecutiveReconnects = 0

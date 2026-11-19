@@ -146,7 +146,7 @@ struct SettingsView: View {
 
                     if viewModel.settings.profiles.count > 1 {
                         Button(role: .destructive) {
-                            viewModel.settings.deleteProfile(id: profile.id)
+                            viewModel.deleteProfile(id: profile.id)
                             loadProfileIntoEditor(viewModel.activeProfile)
                         } label: {
                             Image(systemName: "trash")
@@ -209,7 +209,7 @@ struct SettingsView: View {
                         )
                         savedNote = nil
                         await viewModel.saveProfile(updated, password: passwordDraft, activateAndTest: true)
-                        editingHasStoredPassword = KeychainPasswordStore.loadPassword(forProfileID: targetID) != nil
+                        editingHasStoredPassword = viewModel.editorCredentialSnapshot(forProfileID: targetID).hasStoredPassword
                         if viewModel.lastError == nil {
                             savedNote = "已保存并成功连接「\(updated.name)」。"
                         }
@@ -288,9 +288,9 @@ struct SettingsView: View {
         urlDraft = profile.routerURLString
         wifiSSIDsDraft = profile.wifiSSIDs.joined(separator: ", ")
         hashDraft = profile.hashPreference
-        let storedPassword = KeychainPasswordStore.loadPassword(forProfileID: profile.id)
-        passwordDraft = storedPassword ?? ""
-        editingHasStoredPassword = storedPassword != nil
+        let snapshot = viewModel.editorCredentialSnapshot(forProfileID: profile.id)
+        passwordDraft = snapshot.password
+        editingHasStoredPassword = snapshot.hasStoredPassword
         savedNote = nil
     }
 

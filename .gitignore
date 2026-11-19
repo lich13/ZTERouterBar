@@ -5,3 +5,5 @@ dist/
 *.xcodeproj
 *.xcuserstate
 DerivedData/
+__pycache__/
+*.py[cod]

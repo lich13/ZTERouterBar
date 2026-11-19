@@ -6,14 +6,23 @@ public protocol EndpointProbing: Sendable {
 
 public final class URLEndpointProber: EndpointProbing, @unchecked Sendable {
     private let session: URLSession
+    private let now: @Sendable () -> SuspendingClock.Instant
+    private let sleep: @Sendable (Duration) async throws -> Void
 
-    public init() {
+    public init(
+        now: @escaping @Sendable () -> SuspendingClock.Instant = { SuspendingClock.now },
+        sleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0, clock: .suspending)
+        }
+    ) {
         let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.urlCache = nil
         config.httpShouldSetCookies = false
         config.httpMaximumConnectionsPerHost = 4
         self.session = URLSession(configuration: config, delegate: RedirectBlockerDelegate(), delegateQueue: nil)
+        self.now = now
+        self.sleep = sleep
     }
 
     deinit {
@@ -38,8 +47,8 @@ public final class URLEndpointProber: EndpointProbing, @unchecked Sendable {
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         request.setValue("close", forHTTPHeaderField: "Connection")
 
-        let start = ContinuousClock.now
-        var elapsedMs: Int { durationMillis(start.duration(to: .now)) }
+        let start = now()
+        var elapsedMs: Int { durationMillis(start.duration(to: now())) }
 
         do {
             let response = try await fetchResponseWithHardTimeout(request: request, timeoutSec: timeoutSec)
@@ -57,16 +66,18 @@ public final class URLEndpointProber: EndpointProbing, @unchecked Sendable {
         }
     }
 
-    /// Enforces a hard wall-clock ceiling so DNS or TLS stalls never exceed `endpoint.timeoutSec`.
+    /// Enforces a hard suspending-clock ceiling so DNS or TLS stalls never exceed `endpoint.timeoutSec`
+    /// while ignoring wall-clock time spent in macOS system sleep.
     private func fetchResponseWithHardTimeout(request: URLRequest, timeoutSec: Int) async throws -> URLResponse {
         let session = self.session
+        let sleepFn = self.sleep
         return try await withThrowingTaskGroup(of: URLResponse.self) { group in
             group.addTask {
                 let (_, response) = try await session.data(for: request)
                 return response
             }
             group.addTask {
-                try await Task.sleep(for: .seconds(timeoutSec))
+                try await sleepFn(.seconds(timeoutSec))
                 throw ProbeTimeoutError()
             }
             guard let first = try await group.next() else {

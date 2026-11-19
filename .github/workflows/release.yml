@@ -37,6 +37,11 @@ jobs:
           fi
           APP_VERSION="${VERSION}" ./scripts/build-app.sh release
 
+      - name: Verify native binary privacy
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 scripts/verify_native_privacy.py dist/ZTERouterBar.app/Contents/MacOS/ZTERouterBar
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:

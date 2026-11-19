@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Security
 import ZTERouterCore
 
@@ -212,9 +213,14 @@ final class SettingsStore {
 enum KeychainPasswordStore {
     private static let profileService = "com.zte.routerbar.profile"
     private static let retiredProxyService = "com.zte.routerbar.watchdogProxy"
+    private static let logger = Logger(subsystem: "com.zte.routerbar", category: "keychain")
+
+    static func loadPasswordResult(forProfileID id: UUID) -> KeychainLoadResult {
+        loadResult(service: profileService, account: id.uuidString)
+    }
 
     static func loadPassword(forProfileID id: UUID) -> String? {
-        load(service: profileService, account: id.uuidString)
+        loadPasswordResult(forProfileID: id).password
     }
 
     @discardableResult
@@ -235,7 +241,7 @@ enum KeychainPasswordStore {
         SecItemDelete(query as CFDictionary)
     }
 
-    private static func load(service: String, account: String) -> String? {
+    private static func loadResult(service: String, account: String) -> KeychainLoadResult {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -245,12 +251,13 @@ enum KeychainPasswordStore {
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess,
-              let data = item as? Data,
-              let password = String(data: data, encoding: .utf8) else {
-            return nil
+        if status != errSecSuccess && status != errSecItemNotFound {
+            logger.warning("Keychain read returned status=\(status, privacy: .public) for profile=\(account, privacy: .public)")
         }
-        return password
+        let password: String? = (status == errSecSuccess)
+            ? (item as? Data).flatMap { String(data: $0, encoding: .utf8) }
+            : nil
+        return KeychainLoadResult.classify(status: status, password: password)
     }
 
     private static func save(_ password: String, service: String, account: String) -> OSStatus {

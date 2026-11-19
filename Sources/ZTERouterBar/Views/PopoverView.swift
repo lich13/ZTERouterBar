@@ -18,7 +18,9 @@ struct PopoverView: View {
             headerBar
             wifiAndProfileBar
 
-            if !viewModel.hasStoredPassword {
+            if let issue = viewModel.activeCredentialIssue {
+                keychainAccessPromptCard(issue)
+            } else if !viewModel.hasStoredPassword {
                 quickSetupCard
             } else {
                 wanHeroCard
@@ -203,6 +205,51 @@ struct PopoverView: View {
                 .help("macOS 需要定位权限以读取当前连接的 Wi-Fi 名称")
             }
         }
+    }
+
+    private func keychainAccessPromptCard(_ issue: ProfileCredentialIssue) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "key.fill")
+                    .foregroundStyle(.orange)
+                Text("需读取钥匙串中的管理密码")
+                    .font(.subheadline.weight(.semibold))
+            }
+
+            Text("版本更新后首次读取可能弹出系统授权框，建议选择「始终允许」以免后台切换或唤醒时受阻。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(
+                issue.isSystemDeferred
+                    ? "上次读取因系统非交互态延后（状态码 \(issue.statusCode)）。"
+                    : "上次钥匙串授权未通过（状态码 \(issue.statusCode)），系统不会自动重复弹窗。"
+            )
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.tertiary)
+
+            HStack(spacing: 8) {
+                Button("修改密码…") {
+                    onOpenSettings()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Spacer()
+
+                Button("立即读取密码") {
+                    viewModel.retryUnlockKeychainFromUserAction()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.orange.opacity(0.35), lineWidth: 1)
+        )
     }
 
     private var quickSetupCard: some View {

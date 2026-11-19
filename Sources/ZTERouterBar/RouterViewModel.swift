@@ -31,6 +31,11 @@ final class RouterViewModel {
     var signalHistory: [SignalSample] = []
     var passwordInput: String = ""
     var hasStoredPassword: Bool = false
+    var activeCredentialIssue: ProfileCredentialIssue?
+
+    var isCredentialReady: Bool {
+        !passwordInput.isEmpty
+    }
 
     var isRefreshing: Bool = false
     var isReconnectingWAN: Bool = false
@@ -51,6 +56,7 @@ final class RouterViewModel {
     var actionStatusMessage: String?
     var launchMode: LaunchMode = .manual
 
+    private var credentialState: ProfileCredentialStateMachine
     private var pollingTask: Task<Void, Never>?
     private var watchdogTask: Task<Void, Never>?
     private var clearMessageTask: Task<Void, Never>?
@@ -84,10 +90,23 @@ final class RouterViewModel {
         self.settings = settings
         self.wifiMonitor = wifiMonitor
         self.notifier = notifier
+        self.credentialState = ProfileCredentialStateMachine(initialSSID: wifiMonitor.currentSSID)
         self.reconnectLogs = reconnectLogFile.recentEntries(limit: Self.reconnectLogLimit)
 
         wifiMonitor.onSSIDChanged = { [weak self] ssid in
             self?.handleWiFiSSIDChanged(ssid)
+        }
+        wifiMonitor.onWiFiPathReady = { [weak self] in
+            self?.handleWiFiPathReady()
+        }
+        wifiMonitor.onSystemWillSleep = { [weak self] in
+            self?.handleSystemWillSleep()
+        }
+        wifiMonitor.onSystemDidWake = { [weak self] in
+            self?.handleSystemDidWake()
+        }
+        wifiMonitor.onInteractiveGUIEvent = { [weak self] in
+            self?.handleInteractiveGUIEvent()
         }
 
         if settings.autoMatchByWiFi,
@@ -95,7 +114,11 @@ final class RouterViewModel {
             settings.activeProfileID = matched.id
         }
 
-        reloadPasswordFromKeychain()
+        let isGUI = wifiMonitor.isInteractiveGUISession
+        if isGUI {
+            preloadAllProfilePasswordsIfNeeded(isInteractiveGUI: true)
+        }
+        reloadPasswordFromKeychain(isInteractiveGUI: isGUI)
         rebuildClient()
 
         // Any launch that reaches the UI lifts a previous "user quit on this Wi-Fi" hold.
@@ -113,8 +136,16 @@ final class RouterViewModel {
             await self?.notifier.configureAndRequestAuthorization()
         }
 
-        if settings.watchdogConfig.autoStart && hasStoredPassword {
-            startWatchdog()
+        if settings.watchdogConfig.autoStart {
+            if isCredentialReady {
+                startWatchdog()
+            } else if activeCredentialIssue?.isSystemDeferred == true {
+                credentialState.noteWatchdogPausedForDeferredCredential(
+                    wasRunning: false,
+                    autoStart: true,
+                    userStoppedWatchdog: userStoppedWatchdog
+                )
+            }
         }
     }
 
@@ -134,12 +165,12 @@ final class RouterViewModel {
         guard pollingTask == nil else { return }
         pollingTask = Task { [weak self] in
             while let self, !Task.isCancelled {
-                if self.hasStoredPassword {
+                if self.isCredentialReady && !self.credentialState.isSystemSleeping {
                     await self.refreshNow(silent: true)
                 }
                 let baseInterval = self.isUIActive ? min(2.0, self.settings.pollingInterval) : max(10.0, self.settings.pollingInterval * 2.0)
                 let interval = self.isSessionOccupied ? max(15.0, baseInterval * 4.0) : baseInterval
-                try? await Task.sleep(for: .seconds(interval))
+                try? await Task.sleep(for: .seconds(interval), clock: .suspending)
             }
         }
     }
@@ -152,8 +183,11 @@ final class RouterViewModel {
     func setUIActive(_ active: Bool) {
         isUIActive = active
         if active {
-            wifiMonitor.refreshSSID()
-            if hasStoredPassword && !isSessionOccupied {
+            wifiMonitor.refreshSSID(scheduleFollowUpIfNil: true)
+            if wifiMonitor.isInteractiveGUISession {
+                recoverSessionAndWatchdogAfterWakeOrPathReady(isInteractiveGUI: true, triggerRefresh: false)
+            }
+            if isCredentialReady && !isSessionOccupied {
                 Task { await refreshNow(silent: true) }
             }
         } else if leaveQuitDeferredByUI {
@@ -171,8 +205,17 @@ final class RouterViewModel {
             appendWatchdogLog(WatchdogLogEntry(level: .error, message: "尚未配置有效的路由器地址，无法启动守护"))
             return
         }
-        guard hasStoredPassword || !passwordInput.isEmpty else {
-            appendWatchdogLog(WatchdogLogEntry(level: .warning, message: "尚未保存路由器管理密码，请在配置中设置后再启动守护"))
+        guard isCredentialReady else {
+            if activeCredentialIssue?.isSystemDeferred == true {
+                credentialState.noteWatchdogPausedForDeferredCredential(
+                    wasRunning: false,
+                    autoStart: settings.watchdogConfig.autoStart,
+                    userStoppedWatchdog: userStoppedWatchdog
+                )
+                appendWatchdogLog(WatchdogLogEntry(level: .warning, message: "钥匙串凭据受限延后，待前台解锁后自动恢复守护"))
+            } else {
+                appendWatchdogLog(WatchdogLogEntry(level: .warning, message: "尚未读取到可用的路由器管理密码，请在配置中设置或授权后再启动守护"))
+            }
             return
         }
         let validEndpoints = settings.watchdogConfig.enabledValidEndpoints
@@ -182,9 +225,11 @@ final class RouterViewModel {
         }
 
         userStoppedWatchdog = false
+        credentialState.noteWatchdogStarted()
         watchdogTask?.cancel()
         watchdogGeneration += 1
         let generation = watchdogGeneration
+        let targetProfileID = activeProfile.id
         isWatchdogRunning = true
         watchdogPhase = .idle
         let config = settings.watchdogConfig.clamped()
@@ -198,6 +243,25 @@ final class RouterViewModel {
                 canReconnect: { [weak self] in
                     await MainActor.run {
                         guard let self else { return "已退出" }
+                        guard self.watchdogGeneration == generation else {
+                            return "守护任务已更新，取消旧实例重连"
+                        }
+                        if self.credentialState.isSystemSleeping {
+                            return "系统正在休眠，跳过本次自动重连"
+                        }
+                        self.wifiMonitor.refreshSSID(scheduleFollowUpIfNil: false)
+                        if self.settings.autoMatchByWiFi,
+                           let matched = RouterProfileMatcher.match(ssid: self.wifiMonitor.currentSSID, in: self.settings.profiles),
+                           matched.id != targetProfileID {
+                            self.selectProfile(matched.id, announce: "已按 Wi-Fi「\(self.wifiMonitor.currentSSID ?? "")」自动切换配置：\(matched.name)")
+                            return "Wi-Fi 已切换至「\(matched.name)」，取消向旧配置发重连"
+                        }
+                        guard self.settings.activeProfileID == targetProfileID else {
+                            return "当前生效配置已变更，跳过旧配置自动重连"
+                        }
+                        guard self.isCredentialReady else {
+                            return "当前配置钥匙串凭据尚未就绪，暂不自动重连"
+                        }
                         if self.isReconnectingWAN {
                             return "正在执行手动重连，跳过本次自动重连"
                         }
@@ -234,6 +298,7 @@ final class RouterViewModel {
     func stopWatchdog(userInitiated: Bool = true) {
         if userInitiated {
             userStoppedWatchdog = true
+            credentialState.noteUserStoppedWatchdog()
         }
         let wasRunning = isWatchdogRunning
         watchdogGeneration += 1
@@ -352,19 +417,124 @@ final class RouterViewModel {
         }
     }
 
-    // MARK: - Profile & Wi-Fi Auto-Matching
+    // MARK: - Profile, Sleep/Wake & Keychain Credential Recovery
+
+    private func handleSystemWillSleep() {
+        let wasRunning = isWatchdogRunning
+        credentialState.noteSystemWillSleep(
+            currentSSID: wifiMonitor.currentSSID,
+            isWatchdogRunning: wasRunning
+        )
+        if wasRunning {
+            watchdogGeneration += 1
+            watchdogTask?.cancel()
+            watchdogTask = nil
+            isWatchdogRunning = false
+            watchdogPhase = .idle
+            appendWatchdogLog(WatchdogLogEntry(level: .info, message: "系统进入休眠，保活守护已暂停"))
+        }
+    }
+
+    private func handleSystemDidWake() {
+        wifiMonitor.refreshSSID(scheduleFollowUpIfNil: true)
+        credentialState.noteSystemDidWake(currentSSID: wifiMonitor.currentSSID)
+        recoverSessionAndWatchdogAfterWakeOrPathReady(
+            isInteractiveGUI: wifiMonitor.isInteractiveGUISession,
+            triggerRefresh: true
+        )
+    }
+
+    private func handleInteractiveGUIEvent() {
+        wifiMonitor.refreshSSID(scheduleFollowUpIfNil: true)
+        credentialState.noteSystemDidWake(currentSSID: wifiMonitor.currentSSID)
+        recoverSessionAndWatchdogAfterWakeOrPathReady(
+            isInteractiveGUI: true,
+            triggerRefresh: true
+        )
+    }
+
+    private func handleWiFiPathReady() {
+        recoverSessionAndWatchdogAfterWakeOrPathReady(
+            isInteractiveGUI: wifiMonitor.isInteractiveGUISession,
+            triggerRefresh: true
+        )
+    }
+
+    private func recoverSessionAndWatchdogAfterWakeOrPathReady(
+        isInteractiveGUI: Bool,
+        triggerRefresh: Bool
+    ) {
+        wifiMonitor.refreshSSID(scheduleFollowUpIfNil: true)
+        if settings.autoMatchByWiFi,
+           let ssid = wifiMonitor.currentSSID,
+           let matched = RouterProfileMatcher.match(ssid: ssid, in: settings.profiles),
+           matched.id != settings.activeProfileID {
+            selectProfile(matched.id, announce: "已按 Wi-Fi「\(ssid)」自动切换配置：\(matched.name)")
+            return
+        }
+
+        if isInteractiveGUI {
+            preloadAllProfilePasswordsIfNeeded(isInteractiveGUI: true, forceDeferredRetry: false)
+        }
+
+        let wasReady = isCredentialReady
+        reloadPasswordFromKeychain(isInteractiveGUI: isInteractiveGUI, userInitiatedRetry: false)
+        if !wasReady && isCredentialReady {
+            rebuildClient()
+        }
+
+        guard isCredentialReady else { return }
+        if triggerRefresh && !isSessionOccupied {
+            Task { await refreshNow(silent: true) }
+        }
+        if credentialState.shouldResumeWatchdog(
+            isCredentialReady: isCredentialReady,
+            isWatchdogRunning: isWatchdogRunning,
+            autoStart: settings.watchdogConfig.autoStart,
+            userStoppedWatchdog: userStoppedWatchdog
+        ) {
+            startWatchdog()
+        }
+    }
 
     private func handleWiFiSSIDChanged(_ ssid: String?) {
         evaluateLeaveQuit()
-        guard settings.autoMatchByWiFi else { return }
-        guard let matched = RouterProfileMatcher.match(ssid: ssid, in: settings.profiles) else { return }
-        guard matched.id != settings.activeProfileID else { return }
+        let matched = RouterProfileMatcher.match(ssid: ssid, in: settings.profiles)
+        let decision = credentialState.noteSSIDChanged(
+            ssid,
+            matchedProfileID: matched?.id,
+            activeProfileID: settings.activeProfileID,
+            autoMatchEnabled: settings.autoMatchByWiFi
+        )
 
-        selectProfile(matched.id, announce: "已按 Wi-Fi「\(ssid ?? "")」自动切换配置：\(matched.name)")
+        if let targetID = decision.shouldSelectProfileID, let matched {
+            selectProfile(targetID, announce: "已按 Wi-Fi「\(ssid ?? "")」自动切换配置：\(matched.name)")
+        } else if decision.shouldRefreshSameProfile {
+            let isGUI = wifiMonitor.isInteractiveGUISession
+            if isGUI {
+                preloadAllProfilePasswordsIfNeeded(isInteractiveGUI: true)
+            }
+            let wasReady = isCredentialReady
+            reloadPasswordFromKeychain(isInteractiveGUI: isGUI)
+            if !wasReady && isCredentialReady {
+                rebuildClient()
+            }
+            if isCredentialReady {
+                Task { await refreshNow(silent: true) }
+                if credentialState.shouldResumeWatchdog(
+                    isCredentialReady: isCredentialReady,
+                    isWatchdogRunning: isWatchdogRunning,
+                    autoStart: settings.watchdogConfig.autoStart,
+                    userStoppedWatchdog: userStoppedWatchdog
+                ) {
+                    startWatchdog()
+                }
+            }
+        }
     }
 
     func triggerWiFiAutoMatch() {
-        wifiMonitor.refreshSSID()
+        wifiMonitor.refreshSSID(scheduleFollowUpIfNil: true)
         guard settings.autoMatchByWiFi,
               let ssid = wifiMonitor.currentSSID,
               let matched = RouterProfileMatcher.match(ssid: ssid, in: settings.profiles) else {
@@ -377,33 +547,155 @@ final class RouterViewModel {
 
     func selectProfile(_ profileID: UUID, announce: String? = nil) {
         guard settings.profiles.contains(where: { $0.id == profileID }) else { return }
+        let wasWatchdogRunning = isWatchdogRunning
+        credentialState.noteProfileSelected()
         settings.activeProfileID = profileID
         snapshot = nil
         signalHistory.removeAll()
         lastError = nil
         isSessionOccupied = false
-        reloadPasswordFromKeychain()
+
+        let isGUI = wifiMonitor.isInteractiveGUISession
+        if isGUI {
+            preloadAllProfilePasswordsIfNeeded(isInteractiveGUI: true)
+        }
+        reloadPasswordFromKeychain(isInteractiveGUI: isGUI)
         rebuildClient()
         if let announce {
             showToast(announce)
         }
-        if hasStoredPassword {
+        if isCredentialReady {
             Task { await refreshNow(silent: false) }
-            if isWatchdogRunning || (settings.watchdogConfig.autoStart && !userStoppedWatchdog) {
+            if wasWatchdogRunning || credentialState.shouldResumeWatchdog(
+                isCredentialReady: true,
+                isWatchdogRunning: false,
+                autoStart: settings.watchdogConfig.autoStart,
+                userStoppedWatchdog: userStoppedWatchdog
+            ) {
                 startWatchdog()
             }
-        } else if isWatchdogRunning {
-            stopWatchdog(userInitiated: false)
+        } else {
+            if activeCredentialIssue?.isSystemDeferred == true {
+                credentialState.noteWatchdogPausedForDeferredCredential(
+                    wasRunning: wasWatchdogRunning,
+                    autoStart: settings.watchdogConfig.autoStart,
+                    userStoppedWatchdog: userStoppedWatchdog
+                )
+            }
+            if wasWatchdogRunning {
+                stopWatchdog(userInitiated: false)
+            }
         }
     }
 
-    func reloadPasswordFromKeychain() {
-        if let saved = KeychainPasswordStore.loadPassword(forProfileID: activeProfile.id), !saved.isEmpty {
-            passwordInput = saved
-            hasStoredPassword = true
-        } else {
-            passwordInput = ""
-            hasStoredPassword = false
+    func preloadAllProfilePasswordsIfNeeded(
+        isInteractiveGUI: Bool,
+        forceDeferredRetry: Bool = false
+    ) {
+        let ids = settings.profiles.map(\.id)
+        let diagnostics = credentialState.preloadAllProfilesIfNeeded(
+            profileIDs: ids,
+            isInteractiveGUI: isInteractiveGUI,
+            forceDeferredRetry: forceDeferredRetry,
+            loader: { KeychainPasswordStore.loadPasswordResult(forProfileID: $0) }
+        )
+        for (profileID, diag) in diagnostics {
+            let name = settings.profiles.first(where: { $0.id == profileID })?.name ?? profileID.uuidString
+            appendWatchdogLog(WatchdogLogEntry(level: .warning, message: "\(diag), 配置=\(name)"))
+        }
+    }
+
+    func reloadPasswordFromKeychain(
+        isInteractiveGUI: Bool = false,
+        userInitiatedRetry: Bool = false
+    ) {
+        let profile = activeProfile
+        let (evaluation, diag) = credentialState.loadActiveProfile(
+            id: profile.id,
+            isInteractiveGUI: isInteractiveGUI,
+            userInitiatedRetry: userInitiatedRetry,
+            loader: { KeychainPasswordStore.loadPasswordResult(forProfileID: $0) }
+        )
+        passwordInput = evaluation.password
+        hasStoredPassword = evaluation.hasStoredPassword
+        activeCredentialIssue = evaluation.issue
+        if let diag {
+            appendWatchdogLog(WatchdogLogEntry(level: .warning, message: "\(diag), 配置=\(profile.name)"))
+        }
+    }
+
+    /// Invoked synchronously right before opening the popover or context menu in an active GUI session.
+    /// Retries `.deferredBySystem` items (and runs GUI preload if needed), without re-prompting `.deniedOrFailed`.
+    func prepareCredentialsForInteractiveMenuOrPopover() {
+        let needsKeychainAccess = !credentialState.hasPreloadedAllProfilesInGUI
+            || !credentialState.deferredProfiles.isEmpty
+            || credentialState.peekEvaluation(for: activeProfile.id) == nil
+        if needsKeychainAccess {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        preloadAllProfilePasswordsIfNeeded(isInteractiveGUI: true, forceDeferredRetry: true)
+        let wasReady = isCredentialReady
+        reloadPasswordFromKeychain(isInteractiveGUI: true, userInitiatedRetry: false)
+        if !wasReady && isCredentialReady {
+            rebuildClient()
+            Task { await refreshNow(silent: false) }
+            if credentialState.shouldResumeWatchdog(
+                isCredentialReady: true,
+                isWatchdogRunning: isWatchdogRunning,
+                autoStart: settings.watchdogConfig.autoStart,
+                userStoppedWatchdog: userStoppedWatchdog
+            ) {
+                startWatchdog()
+            }
+        }
+    }
+
+    /// Explicit user button click ("立即读取密码"): clears `.deniedOrFailed` / `.deferredBySystem` hold for active profile.
+    func retryUnlockKeychainFromUserAction() {
+        NSApp.activate(ignoringOtherApps: true)
+        reloadPasswordFromKeychain(isInteractiveGUI: true, userInitiatedRetry: true)
+        preloadAllProfilePasswordsIfNeeded(isInteractiveGUI: true, forceDeferredRetry: true)
+        rebuildClient()
+        if isCredentialReady {
+            lastError = nil
+            Task { await refreshNow(silent: false) }
+            if credentialState.shouldResumeWatchdog(
+                isCredentialReady: true,
+                isWatchdogRunning: isWatchdogRunning,
+                autoStart: settings.watchdogConfig.autoStart,
+                userStoppedWatchdog: userStoppedWatchdog
+            ) {
+                startWatchdog()
+            }
+        }
+    }
+
+    func editorCredentialSnapshot(forProfileID id: UUID) -> (password: String, hasStoredPassword: Bool) {
+        if let peeked = credentialState.peekEvaluation(for: id) {
+            return (peeked.password, peeked.hasStoredPassword)
+        }
+        if wifiMonitor.isInteractiveGUISession {
+            let (eval, diag) = credentialState.loadActiveProfile(
+                id: id,
+                isInteractiveGUI: true,
+                userInitiatedRetry: false,
+                loader: { KeychainPasswordStore.loadPasswordResult(forProfileID: $0) }
+            )
+            if let diag {
+                let name = settings.profiles.first(where: { $0.id == id })?.name ?? id.uuidString
+                appendWatchdogLog(WatchdogLogEntry(level: .warning, message: "\(diag), 配置=\(name)"))
+            }
+            return (eval.password, eval.hasStoredPassword)
+        }
+        return ("", false)
+    }
+
+    func deleteProfile(id: UUID) {
+        let wasActive = (settings.activeProfileID == id)
+        credentialState.purgeProfile(id: id)
+        settings.deleteProfile(id: id)
+        if wasActive {
+            selectProfile(settings.activeProfileID)
         }
     }
 
@@ -418,9 +710,11 @@ final class RouterViewModel {
             let trimmedPass = password.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmedPass.isEmpty {
                 let status = KeychainPasswordStore.savePassword(trimmedPass, forProfileID: profile.id)
+                credentialState.storeUnlockedPassword(trimmedPass, for: profile.id)
                 if profile.id == settings.activeProfileID || activateAndTest {
                     passwordInput = trimmedPass
                     hasStoredPassword = true
+                    activeCredentialIssue = nil
                 }
                 if status != errSecSuccess {
                     showToast("配置已保存（钥匙串状态码：\(status)）")
@@ -429,25 +723,29 @@ final class RouterViewModel {
         }
 
         if activateAndTest {
+            credentialState.noteProfileSelected()
             settings.activeProfileID = profile.id
             snapshot = nil
             signalHistory.removeAll()
             isSessionOccupied = false
-            reloadPasswordFromKeychain()
+            reloadPasswordFromKeychain(isInteractiveGUI: wifiMonitor.isInteractiveGUISession)
             rebuildClient()
             await refreshNow(silent: false)
             if lastError == nil {
                 showToast("已保存并成功连接「\(profile.name)」")
             }
-            if hasStoredPassword && settings.watchdogConfig.autoStart && !userStoppedWatchdog && !isWatchdogRunning {
-                startWatchdog()
-            } else if isWatchdogRunning {
+            if isCredentialReady && (isWatchdogRunning || credentialState.shouldResumeWatchdog(
+                isCredentialReady: true,
+                isWatchdogRunning: false,
+                autoStart: settings.watchdogConfig.autoStart,
+                userStoppedWatchdog: userStoppedWatchdog
+            )) {
                 startWatchdog()
             }
         } else if profile.id == settings.activeProfileID {
-            reloadPasswordFromKeychain()
+            reloadPasswordFromKeychain(isInteractiveGUI: wifiMonitor.isInteractiveGUISession)
             rebuildClient()
-            if isWatchdogRunning {
+            if isWatchdogRunning && isCredentialReady {
                 startWatchdog()
             }
         }
@@ -468,11 +766,14 @@ final class RouterViewModel {
 
     func clearPassword(forProfileID profileID: UUID) {
         KeychainPasswordStore.deletePassword(forProfileID: profileID)
+        credentialState.removePassword(for: profileID)
         if profileID == settings.activeProfileID {
             passwordInput = ""
             hasStoredPassword = false
+            activeCredentialIssue = nil
             snapshot = nil
             isSessionOccupied = false
+            credentialState.noteUserStoppedWatchdog()
             stopWatchdog(userInitiated: false)
             rebuildClient()
         }
@@ -518,13 +819,23 @@ final class RouterViewModel {
             if !silent { lastError = "当前配置的路由器地址无效。" }
             return
         }
-        guard hasStoredPassword || !passwordInput.isEmpty else {
-            if !silent { lastError = ZTERouterError.missingPassword.localizedDescription }
+        guard isCredentialReady else {
+            if !silent {
+                if let issue = activeCredentialIssue {
+                    lastError = issue.isSystemDeferred
+                        ? "钥匙串凭据暂受限（状态码 \(issue.statusCode)），请点击「立即读取密码」重试。"
+                        : "读取钥匙串管理密码未获授权（状态码 \(issue.statusCode)），请点击「立即读取密码」授权。"
+                } else {
+                    lastError = ZTERouterError.missingPassword.localizedDescription
+                }
+            }
             return
         }
 
         isRefreshing = true
         defer { isRefreshing = false }
+
+        let allowReclaim = credentialState.effectiveReclaimFlag(silentPoll: silent)
 
         do {
             // Station lists cost two extra requests: only while the UI is visible, and every ~10s.
@@ -532,9 +843,10 @@ final class RouterViewModel {
             let stationsStale = lastStationFetchAt.map { Date().timeIntervalSince($0) >= 10 } ?? true
             let needStations = previous == nil || (isUIActive && stationsStale)
             var fresh = try await client.fetchStatus(
-                reclaimIfDuplicate: !silent,
+                reclaimIfDuplicate: allowReclaim,
                 includeStationLists: needStations
             )
+            credentialState.noteRouterInteractionResult(error: nil)
             if needStations {
                 lastStationFetchAt = Date()
             } else if isUIActive, let previous {
@@ -546,6 +858,7 @@ final class RouterViewModel {
             self.lastError = nil
             self.isSessionOccupied = false
         } catch let routerError as ZTERouterError {
+            credentialState.noteRouterInteractionResult(error: routerError)
             switch routerError {
             case .duplicateUser:
                 self.isSessionOccupied = true
@@ -573,8 +886,15 @@ final class RouterViewModel {
             showToast("保活守护正在自动重连，请稍候")
             return
         }
-        guard let client else {
-            lastError = "请先配置路由器地址与密码。"
+        if !isCredentialReady, activeCredentialIssue?.isSystemDeferred == true, wifiMonitor.isInteractiveGUISession {
+            prepareCredentialsForInteractiveMenuOrPopover()
+        }
+        guard let client, isCredentialReady else {
+            if let issue = activeCredentialIssue {
+                lastError = "需先读取钥匙串中的管理密码（状态码 \(issue.statusCode)）。"
+            } else {
+                lastError = "请先配置路由器地址与密码。"
+            }
             return
         }
 

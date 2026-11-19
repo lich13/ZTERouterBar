@@ -10,9 +10,20 @@ DIST_DIR="${ROOT_DIR}/dist"
 APP_BUNDLE="${DIST_DIR}/${APP_NAME}.app"
 
 cd "${ROOT_DIR}"
-swift build -c "${BUILD_CONFIG}"
+SWIFT_BUILD_FLAGS=(
+  -c "${BUILD_CONFIG}"
+  -Xswiftc -file-prefix-map -Xswiftc "${ROOT_DIR}=/build/ZTERouterBar"
+  -Xswiftc -file-prefix-map -Xswiftc "${HOME}=/build"
+  -Xswiftc -file-prefix-map -Xswiftc "/private/var/folders=/build/var-folders"
+  -Xswiftc -file-prefix-map -Xswiftc "/var/folders=/build/var-folders"
+  -Xcc "-ffile-prefix-map=${ROOT_DIR}=/build/ZTERouterBar"
+  -Xcc "-ffile-prefix-map=${HOME}=/build"
+  -Xcc "-ffile-prefix-map=/private/var/folders=/build/var-folders"
+  -Xcc "-ffile-prefix-map=/var/folders=/build/var-folders"
+)
+swift build "${SWIFT_BUILD_FLAGS[@]}"
 
-BIN_DIR="$(swift build -c "${BUILD_CONFIG}" --show-bin-path)"
+BIN_DIR="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)"
 EXECUTABLE="${BIN_DIR}/${APP_NAME}"
 
 rm -rf "${APP_BUNDLE}"

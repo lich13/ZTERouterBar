@@ -78,6 +78,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
             _ = viewModel.watchdogPhase
             _ = viewModel.lastError
             _ = viewModel.hasStoredPassword
+            _ = viewModel.activeCredentialIssue
+            _ = viewModel.passwordInput
             _ = viewModel.settings.activeProfileID
             _ = viewModel.settings.menuBarDisplayStyleRaw
             _ = viewModel.settings.globalShortcutEnabled
@@ -118,6 +120,10 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
             symbolName = "exclamationmark.triangle"
             tintColor = .systemOrange
             tintKey = "orange"
+        } else if viewModel.activeCredentialIssue != nil {
+            symbolName = "lock.fill"
+            tintColor = .systemOrange
+            tintKey = "orange"
         } else if !viewModel.hasStoredPassword {
             symbolName = "antenna.radiowaves.left.and.right.slash"
             tintColor = .secondaryLabelColor
@@ -151,6 +157,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
             titleText = " 重连中"
         } else if viewModel.isSessionOccupied {
             titleText = viewModel.settings.menuBarDisplayStyle == .iconOnly ? "" : " 占用"
+        } else if viewModel.activeCredentialIssue != nil {
+            titleText = viewModel.settings.menuBarDisplayStyle == .iconOnly ? "" : " 待授权"
         } else if let snap = viewModel.snapshot {
             switch viewModel.settings.menuBarDisplayStyle {
             case .iconOnly:
@@ -226,6 +234,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
 
     private func openPopover() {
         guard let button = statusItem.button else { return }
+        viewModel.prepareCredentialsForInteractiveMenuOrPopover()
         let content = makePopoverContent()
         popover.contentViewController = content
         popover.contentSize = content.view.fittingSize
@@ -248,6 +257,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
     // MARK: - Context Menu
 
     private func showContextMenu() {
+        viewModel.prepareCredentialsForInteractiveMenuOrPopover()
         let menu = NSMenu()
 
         let statusText: String
@@ -261,17 +271,24 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         menu.addItem(headerItem)
         menu.addItem(.separator())
 
+        if viewModel.activeCredentialIssue != nil {
+            let unlockItem = NSMenuItem(title: "立即读取钥匙串密码…", action: #selector(menuRetryUnlockKeychain), keyEquivalent: "")
+            unlockItem.target = self
+            menu.addItem(unlockItem)
+            menu.addItem(.separator())
+        }
+
         let isConnected = viewModel.snapshot?.connectionState.isConnected ?? true
         let reconnectTitle = isConnected ? "一键重连外网 (⌃⌥W)" : "立即连接外网 (⌃⌥W)"
         let reconnectItem = NSMenuItem(title: reconnectTitle, action: #selector(menuReconnectWAN), keyEquivalent: "")
         reconnectItem.target = self
-        reconnectItem.isEnabled = viewModel.hasStoredPassword && !viewModel.isReconnectingWAN
+        reconnectItem.isEnabled = viewModel.isCredentialReady && !viewModel.isReconnectingWAN
         menu.addItem(reconnectItem)
 
         let watchdogTitle = viewModel.isWatchdogRunning ? "停止外网保活守护" : "开启外网保活守护"
         let watchdogItem = NSMenuItem(title: watchdogTitle, action: #selector(menuToggleWatchdog), keyEquivalent: "")
         watchdogItem.target = self
-        watchdogItem.isEnabled = viewModel.hasStoredPassword
+        watchdogItem.isEnabled = viewModel.isCredentialReady
         menu.addItem(watchdogItem)
 
         if viewModel.settings.profiles.count > 1 {
@@ -322,6 +339,10 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
         statusItem.menu = nil
+    }
+
+    @objc private func menuRetryUnlockKeychain() {
+        viewModel.retryUnlockKeychainFromUserAction()
     }
 
     @objc private func menuReconnectWAN() {

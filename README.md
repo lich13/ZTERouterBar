@@ -33,7 +33,7 @@
 
 ```bash
 swift test
-PACKAGE_DMG=1 APP_VERSION=1.0.0 ./scripts/build-app.sh release
+PACKAGE_DMG=1 APP_VERSION=1.2.2 ./scripts/build-app.sh release
 ```
 
 ## 隐私说明
