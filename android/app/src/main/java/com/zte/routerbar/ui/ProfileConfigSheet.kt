@@ -35,6 +35,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -62,16 +63,27 @@ fun ProfileConfigSheet(
         viewModel.requestCloseProfileSheet()
     }
 
-    val sheetState = rememberModalBottomSheetState(
-        skipPartiallyExpanded = true,
-        confirmValueChange = { target ->
-            if (target == SheetValue.Hidden && uiState.hasUnsavedDraftChanges) {
-                viewModel.requestCloseProfileSheet()
-                false
-            } else {
-                true
+    // Material3 keys the sheet state on this lambda instance, so it must not capture uiState:
+    // a new instance per emission rebuilds the state as Hidden and replays the slide-in on every poll.
+    val confirmSheetValueChange: (SheetValue) -> Boolean = remember(viewModel) {
+        { target: SheetValue ->
+            val state = viewModel.uiState.value
+            when {
+                target != SheetValue.Hidden -> true
+                // requestCloseProfileSheet() ignores closes while saving; hiding here would leave
+                // an invisible sheet that still blocks the screen.
+                state.isSavingProfile -> false
+                state.hasUnsavedDraftChanges -> {
+                    viewModel.requestCloseProfileSheet()
+                    false
+                }
+                else -> true
             }
         }
+    }
+    val sheetState = rememberModalBottomSheetState(
+        skipPartiallyExpanded = true,
+        confirmValueChange = confirmSheetValueChange
     )
 
     if (uiState.showDiscardDialog) {

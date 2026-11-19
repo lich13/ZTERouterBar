@@ -38,10 +38,10 @@
 ```bash
 # macOS
 swift test
-PACKAGE_DMG=1 APP_VERSION=1.3.1 ./scripts/build-app.sh release
+PACKAGE_DMG=1 APP_VERSION=1.3.2 ./scripts/build-app.sh release
 
 # Android (需 JDK 21+ 与 Android SDK)
-cd android && ./gradlew testDebugUnitTest assembleRelease -PappVersion=1.3.1
+cd android && ./gradlew testDebugUnitTest assembleRelease -PappVersion=1.3.2
 ```
 
 ## 隐私说明
