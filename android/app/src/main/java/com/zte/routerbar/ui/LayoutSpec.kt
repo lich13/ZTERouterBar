@@ -48,6 +48,7 @@ object LayoutSpec {
     const val TOOLBAR_CONTROL_HEIGHT_DP = 36
     const val MIN_TOUCH_TARGET_DP = 48
     const val CHART_HEIGHT_DP = 172
+    const val CHART_Y_AXIS_WIDTH_DP = 34
     const val SIGNAL_HISTORY_LIMIT = 120
     const val STATION_FETCH_INTERVAL_MS = 10_000L
 

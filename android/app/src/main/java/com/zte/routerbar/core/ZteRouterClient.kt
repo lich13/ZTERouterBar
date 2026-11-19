@@ -149,8 +149,8 @@ class ZteRouterClient(
         )
         if (rd.isNotEmpty()) {
             val ad = RouterCrypto.computeAD(
-                waInnerVersion = wa.ifEmpty { cachedWaInnerVersion },
-                crVersion = if (wa.isEmpty()) cachedCrVersion else cr,
+                waInnerVersion = wa,
+                crVersion = cr,
                 rd = rd,
                 algorithm = algo
             )

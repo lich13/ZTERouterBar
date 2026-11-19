@@ -268,7 +268,7 @@ fun ProfileConfigSheet(
                             }
 
                             if (!isActive) {
-                                OutlinedButton(onClick = { viewModel.selectProfile(profile.id) }) {
+                                OutlinedButton(onClick = { viewModel.selectProfileFromSheet(profile.id) }) {
                                     Text("切换")
                                 }
                             }
@@ -286,13 +286,44 @@ fun ProfileConfigSheet(
                         }
                     }
                 }
+                if (uiState.isEditingUnsavedNewProfile) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "${uiState.draftName.ifBlank { "新路由器配置" }}（未保存草稿）",
+                                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = uiState.draftUrl.ifBlank { "http://192.168.8.1" },
+                                    style = MaterialTheme.typography.labelSmall.tabularNums(),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+                }
             }
 
             HorizontalDivider()
 
             // Selected profile editor
             Text(
-                text = "编辑配置详情",
+                text = if (uiState.isEditingUnsavedNewProfile) "新增配置详情" else "编辑配置详情",
                 style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold)
             )
 
@@ -320,7 +351,12 @@ fun ProfileConfigSheet(
                     modifier = Modifier.weight(1f)
                 )
                 if (!uiState.wifiGatewayIp.isNullOrBlank()) {
-                    OutlinedButton(onClick = { viewModel.fillCurrentGatewayIntoDraft() }) {
+                    OutlinedButton(
+                        onClick = { viewModel.fillCurrentGatewayIntoDraft() },
+                        modifier = Modifier
+                            .padding(top = 6.dp)
+                            .heightIn(min = LayoutSpec.MIN_TOUCH_TARGET_DP.dp)
+                    ) {
                         Text("填入网关")
                     }
                 }
@@ -389,6 +425,21 @@ fun ProfileConfigSheet(
                 }
             }
 
+            uiState.lastError?.let { errorMsg ->
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = errorMsg,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
+                    )
+                }
+            }
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -409,7 +460,9 @@ fun ProfileConfigSheet(
                 Spacer(modifier = Modifier.weight(1f))
                 Button(
                     onClick = { viewModel.saveDraftAndActivate() },
-                    enabled = !uiState.isSavingProfile
+                    enabled = !uiState.isSavingProfile &&
+                        uiState.draftUrl.trim().isNotEmpty() &&
+                        (uiState.draftPassword.trim().isNotEmpty() || uiState.draftHasStoredPassword)
                 ) {
                     Text(if (uiState.isSavingProfile) "保存连接中…" else "保存并测试连接")
                 }

@@ -106,6 +106,7 @@ public struct ProfileCredentialStateMachine: Sendable {
     private var deferredStatus: [UUID: Int32] = [:]
     private var knownMissingProfiles: Set<UUID> = []
     public private(set) var lastKeychainAttemptAt: [UUID: Date] = [:]
+    private var cooldownSuppressedUntil: [UUID: Date] = [:]
 
     public private(set) var hasPreloadedAllProfilesInGUI: Bool = false
     public private(set) var watchdogPausedBySystem: Bool = false
@@ -177,6 +178,7 @@ public struct ProfileCredentialStateMachine: Sendable {
                 }
                 if let lastAttempt = lastKeychainAttemptAt[id],
                    now.timeIntervalSince(lastAttempt) < Self.perProfileRetryCooldownSec {
+                    cooldownSuppressedUntil[id] = lastAttempt.addingTimeInterval(Self.perProfileRetryCooldownSec)
                     return (
                         ProfileCredentialEvaluation(
                             password: "",
@@ -189,6 +191,7 @@ public struct ProfileCredentialStateMachine: Sendable {
             }
         }
 
+        cooldownSuppressedUntil.removeValue(forKey: id)
         lastKeychainAttemptAt[id] = now
         let result = loader(id)
         switch result {
@@ -290,6 +293,7 @@ public struct ProfileCredentialStateMachine: Sendable {
         deferredStatus.removeValue(forKey: id)
         deniedStatus.removeValue(forKey: id)
         knownMissingProfiles.remove(id)
+        cooldownSuppressedUntil.removeValue(forKey: id)
     }
 
     public mutating func removePassword(for id: UUID) {
@@ -298,6 +302,7 @@ public struct ProfileCredentialStateMachine: Sendable {
         deferredStatus.removeValue(forKey: id)
         deniedStatus.removeValue(forKey: id)
         knownMissingProfiles.insert(id)
+        cooldownSuppressedUntil.removeValue(forKey: id)
     }
 
     public mutating func purgeProfile(id: UUID) {
@@ -307,6 +312,20 @@ public struct ProfileCredentialStateMachine: Sendable {
         deniedStatus.removeValue(forKey: id)
         knownMissingProfiles.remove(id)
         lastKeychainAttemptAt.removeValue(forKey: id)
+        cooldownSuppressedUntil.removeValue(forKey: id)
+    }
+
+    /// Returns the shortest remaining delay when an interactive GUI retry was skipped solely due to
+    /// `perProfileRetryCooldownSec` from an earlier (e.g. DarkWake) attempt. Returns `nil` once `loader`
+    /// has actually executed so failed GUI reads never loop.
+    public func nextCooldownRetryDelaySec(now: Date = Date()) -> TimeInterval? {
+        let pending = deferredProfiles.compactMap { id -> TimeInterval? in
+            guard deniedStatus[id] == nil, unlockedCache[id] == nil, let until = cooldownSuppressedUntil[id] else {
+                return nil
+            }
+            return max(0.05, until.timeIntervalSince(now))
+        }
+        return pending.min()
     }
 
     // MARK: - Watchdog Pause / Resume

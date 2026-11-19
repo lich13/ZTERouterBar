@@ -1,5 +1,6 @@
 package com.zte.routerbar.ui
 
+import java.time.ZoneOffset
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -54,6 +55,7 @@ class LayoutSpecTest {
 
         assertEquals("05:43:33", Formatters.duration(20_613))
         assertEquals("1.50 GB", Formatters.byteCount(1_610_612_736L))
+        assertEquals("22:13:20", Formatters.timeOfDay(1_700_000_000_000L, ZoneOffset.UTC))
         assertEquals(MetricTone.EXCELLENT, Formatters.rsrpTone("-76"))
         assertEquals(MetricTone.POOR, Formatters.rsrpTone("-115"))
     }

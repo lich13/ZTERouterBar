@@ -2,6 +2,8 @@ package com.zte.routerbar.ui
 
 import com.zte.routerbar.core.RouterStatusSnapshot
 import com.zte.routerbar.core.SignalQualityGrade
+import java.time.Instant
+import java.time.ZoneId
 import java.util.Locale
 
 object Formatters {
@@ -68,5 +70,10 @@ object Formatters {
         SignalChartMetric.RSRP -> String.format(Locale.US, "%.0f dBm", value)
         SignalChartMetric.SINR -> String.format(Locale.US, "%.1f dB", value)
         SignalChartMetric.SCORE -> String.format(Locale.US, "%.0f 分", value)
+    }
+
+    fun timeOfDay(timestampMs: Long, zoneId: ZoneId = ZoneId.systemDefault()): String {
+        val local = Instant.ofEpochMilli(timestampMs).atZone(zoneId).toLocalTime()
+        return String.format(Locale.US, "%02d:%02d:%02d", local.hour, local.minute, local.second)
     }
 }

@@ -12,6 +12,7 @@ struct SettingsView: View {
     @State private var hashDraft: AuthHashPreference = .auto
     @State private var savedNote: String?
     @State private var editingHasStoredPassword: Bool = false
+    @State private var editingCredentialIssue: ProfileCredentialIssue?
 
     var body: some View {
         Form {
@@ -182,6 +183,32 @@ struct SettingsView: View {
             TextField("管理后台地址", text: $urlDraft, prompt: Text("http://192.168.8.1"))
             SecureField("管理密码 (按配置独立加密存入钥匙串)", text: $passwordDraft, prompt: Text("输入管理密码"))
 
+            if let targetID = editingProfileID, let issue = editingCredentialIssue {
+                HStack(spacing: 8) {
+                    Image(systemName: "key.fill")
+                        .foregroundStyle(.orange)
+                    Text(
+                        issue.isSystemDeferred
+                            ? "钥匙串读取暂受限（状态码 \(issue.statusCode)），可点击重新读取或直接输入新密码覆盖。"
+                            : "上次读取钥匙串凭据未获授权（状态码 \(issue.statusCode)），系统不会自动重复弹窗。"
+                    )
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("重新读取钥匙串凭据") {
+                        let refreshed = viewModel.retryUnlockProfileFromEditor(id: targetID)
+                        passwordDraft = refreshed.password
+                        editingHasStoredPassword = refreshed.hasStoredPassword
+                        editingCredentialIssue = refreshed.issue
+                        if refreshed.issue == nil && !refreshed.password.isEmpty {
+                            savedNote = "已成功读取钥匙串中的管理密码。"
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+
             HStack {
                 TextField("绑定 Wi-Fi 名称 (多个用逗号分隔)", text: $wifiSSIDsDraft, prompt: Text("例如：MyWiFi_5G, MyWiFi_2.4G"))
                 Button("填入当前 Wi-Fi") {
@@ -209,7 +236,9 @@ struct SettingsView: View {
                         )
                         savedNote = nil
                         await viewModel.saveProfile(updated, password: passwordDraft, activateAndTest: true)
-                        editingHasStoredPassword = viewModel.editorCredentialSnapshot(forProfileID: targetID).hasStoredPassword
+                        let refreshed = viewModel.editorCredentialSnapshot(forProfileID: targetID)
+                        editingHasStoredPassword = refreshed.hasStoredPassword
+                        editingCredentialIssue = refreshed.issue
                         if viewModel.lastError == nil {
                             savedNote = "已保存并成功连接「\(updated.name)」。"
                         }
@@ -221,6 +250,7 @@ struct SettingsView: View {
                     Button("清除此配置密码", role: .destructive) {
                         viewModel.clearPassword(forProfileID: targetID)
                         editingHasStoredPassword = false
+                        editingCredentialIssue = nil
                         passwordDraft = ""
                         savedNote = "已从钥匙串移除此配置的密码。"
                     }
@@ -291,6 +321,7 @@ struct SettingsView: View {
         let snapshot = viewModel.editorCredentialSnapshot(forProfileID: profile.id)
         passwordDraft = snapshot.password
         editingHasStoredPassword = snapshot.hasStoredPassword
+        editingCredentialIssue = snapshot.issue
         savedNote = nil
     }
 

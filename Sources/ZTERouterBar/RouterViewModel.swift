@@ -59,8 +59,11 @@ final class RouterViewModel {
     private var credentialState: ProfileCredentialStateMachine
     private var pollingTask: Task<Void, Never>?
     private var watchdogTask: Task<Void, Never>?
+    private var deferredCooldownRetryTask: Task<Void, Never>?
     private var clearMessageTask: Task<Void, Never>?
     private var userStoppedWatchdog = false
+    /// Bumped on every client rebuild so an in-flight poll from a previous profile cannot clobber current state.
+    private var clientGeneration = 0
     /// Bumped on every start/stop so a superseded watchdog task cannot touch current state.
     private var watchdogGeneration = 0
     private var manualReconnectGraceUntil: Date?
@@ -119,6 +122,9 @@ final class RouterViewModel {
             preloadAllProfilePasswordsIfNeeded(isInteractiveGUI: true)
         }
         reloadPasswordFromKeychain(isInteractiveGUI: isGUI)
+        if isGUI {
+            scheduleDeferredCooldownRetryIfNeeded()
+        }
         rebuildClient()
 
         // Any launch that reaches the UI lifts a previous "user quit on this Wi-Fi" hold.
@@ -420,6 +426,8 @@ final class RouterViewModel {
     // MARK: - Profile, Sleep/Wake & Keychain Credential Recovery
 
     private func handleSystemWillSleep() {
+        deferredCooldownRetryTask?.cancel()
+        deferredCooldownRetryTask = nil
         let wasRunning = isWatchdogRunning
         credentialState.noteSystemWillSleep(
             currentSSID: wifiMonitor.currentSSID,
@@ -436,8 +444,8 @@ final class RouterViewModel {
     }
 
     private func handleSystemDidWake() {
-        wifiMonitor.refreshSSID(scheduleFollowUpIfNil: true)
         credentialState.noteSystemDidWake(currentSSID: wifiMonitor.currentSSID)
+        wifiMonitor.refreshSSID(scheduleFollowUpIfNil: true)
         recoverSessionAndWatchdogAfterWakeOrPathReady(
             isInteractiveGUI: wifiMonitor.isInteractiveGUISession,
             triggerRefresh: true
@@ -445,8 +453,8 @@ final class RouterViewModel {
     }
 
     private func handleInteractiveGUIEvent() {
-        wifiMonitor.refreshSSID(scheduleFollowUpIfNil: true)
         credentialState.noteSystemDidWake(currentSSID: wifiMonitor.currentSSID)
+        wifiMonitor.refreshSSID(scheduleFollowUpIfNil: true)
         recoverSessionAndWatchdogAfterWakeOrPathReady(
             isInteractiveGUI: true,
             triggerRefresh: true
@@ -479,6 +487,9 @@ final class RouterViewModel {
 
         let wasReady = isCredentialReady
         reloadPasswordFromKeychain(isInteractiveGUI: isInteractiveGUI, userInitiatedRetry: false)
+        if isInteractiveGUI {
+            scheduleDeferredCooldownRetryIfNeeded()
+        }
         if !wasReady && isCredentialReady {
             rebuildClient()
         }
@@ -494,6 +505,22 @@ final class RouterViewModel {
             userStoppedWatchdog: userStoppedWatchdog
         ) {
             startWatchdog()
+        }
+    }
+
+    private func scheduleDeferredCooldownRetryIfNeeded() {
+        guard let delaySec = credentialState.nextCooldownRetryDelaySec() else {
+            deferredCooldownRetryTask?.cancel()
+            deferredCooldownRetryTask = nil
+            return
+        }
+        deferredCooldownRetryTask?.cancel()
+        deferredCooldownRetryTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int((delaySec + 0.05) * 1000)), clock: .suspending)
+            guard !Task.isCancelled, let self else { return }
+            self.deferredCooldownRetryTask = nil
+            guard self.wifiMonitor.isInteractiveGUISession else { return }
+            self.recoverSessionAndWatchdogAfterWakeOrPathReady(isInteractiveGUI: true, triggerRefresh: true)
         }
     }
 
@@ -516,6 +543,9 @@ final class RouterViewModel {
             }
             let wasReady = isCredentialReady
             reloadPasswordFromKeychain(isInteractiveGUI: isGUI)
+            if isGUI {
+                scheduleDeferredCooldownRetryIfNeeded()
+            }
             if !wasReady && isCredentialReady {
                 rebuildClient()
             }
@@ -560,6 +590,9 @@ final class RouterViewModel {
             preloadAllProfilePasswordsIfNeeded(isInteractiveGUI: true)
         }
         reloadPasswordFromKeychain(isInteractiveGUI: isGUI)
+        if isGUI {
+            scheduleDeferredCooldownRetryIfNeeded()
+        }
         rebuildClient()
         if let announce {
             showToast(announce)
@@ -670,9 +703,13 @@ final class RouterViewModel {
         }
     }
 
-    func editorCredentialSnapshot(forProfileID id: UUID) -> (password: String, hasStoredPassword: Bool) {
+    func editorCredentialSnapshot(forProfileID id: UUID) -> (
+        password: String,
+        hasStoredPassword: Bool,
+        issue: ProfileCredentialIssue?
+    ) {
         if let peeked = credentialState.peekEvaluation(for: id) {
-            return (peeked.password, peeked.hasStoredPassword)
+            return (peeked.password, peeked.hasStoredPassword, peeked.issue)
         }
         if wifiMonitor.isInteractiveGUISession {
             let (eval, diag) = credentialState.loadActiveProfile(
@@ -685,9 +722,32 @@ final class RouterViewModel {
                 let name = settings.profiles.first(where: { $0.id == id })?.name ?? id.uuidString
                 appendWatchdogLog(WatchdogLogEntry(level: .warning, message: "\(diag), 配置=\(name)"))
             }
-            return (eval.password, eval.hasStoredPassword)
+            return (eval.password, eval.hasStoredPassword, eval.issue)
         }
-        return ("", false)
+        return ("", false, nil)
+    }
+
+    func retryUnlockProfileFromEditor(id: UUID) -> (
+        password: String,
+        hasStoredPassword: Bool,
+        issue: ProfileCredentialIssue?
+    ) {
+        if id == settings.activeProfileID {
+            retryUnlockKeychainFromUserAction()
+            return (passwordInput, hasStoredPassword, activeCredentialIssue)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let (eval, diag) = credentialState.loadActiveProfile(
+            id: id,
+            isInteractiveGUI: true,
+            userInitiatedRetry: true,
+            loader: { KeychainPasswordStore.loadPasswordResult(forProfileID: $0) }
+        )
+        if let diag {
+            let name = settings.profiles.first(where: { $0.id == id })?.name ?? id.uuidString
+            appendWatchdogLog(WatchdogLogEntry(level: .warning, message: "\(diag), 配置=\(name)"))
+        }
+        return (eval.password, eval.hasStoredPassword, eval.issue)
     }
 
     func deleteProfile(id: UUID) {
@@ -710,14 +770,16 @@ final class RouterViewModel {
             let trimmedPass = password.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmedPass.isEmpty {
                 let status = KeychainPasswordStore.savePassword(trimmedPass, forProfileID: profile.id)
-                credentialState.storeUnlockedPassword(trimmedPass, for: profile.id)
-                if profile.id == settings.activeProfileID || activateAndTest {
-                    passwordInput = trimmedPass
-                    hasStoredPassword = true
-                    activeCredentialIssue = nil
-                }
-                if status != errSecSuccess {
-                    showToast("配置已保存（钥匙串状态码：\(status)）")
+                if status == errSecSuccess {
+                    credentialState.storeUnlockedPassword(trimmedPass, for: profile.id)
+                    if profile.id == settings.activeProfileID || activateAndTest {
+                        passwordInput = trimmedPass
+                        hasStoredPassword = true
+                        activeCredentialIssue = nil
+                    }
+                } else {
+                    lastError = "保存钥匙串管理密码未成功（状态码 \(status)），请重试授权或检查钥匙串状态。"
+                    return
                 }
             }
         }
@@ -796,6 +858,9 @@ final class RouterViewModel {
     }
 
     func rebuildClient() {
+        clientGeneration += 1
+        isRefreshing = false
+        lastStationFetchAt = nil
         let profile = activeProfile
         do {
             let config = try RouterEndpointConfig(
@@ -814,7 +879,16 @@ final class RouterViewModel {
     // MARK: - Refresh
 
     func refreshNow(silent: Bool = false) async {
-        guard !isRefreshing else { return }
+        let entryGen = clientGeneration
+        if isRefreshing {
+            guard !silent else { return }
+            for _ in 0..<20 {
+                if !isRefreshing || clientGeneration != entryGen { break }
+                try? await Task.sleep(for: .milliseconds(100), clock: .suspending)
+            }
+            guard !isRefreshing else { return }
+        }
+        let gen = clientGeneration
         guard let client else {
             if !silent { lastError = "当前配置的路由器地址无效。" }
             return
@@ -833,7 +907,11 @@ final class RouterViewModel {
         }
 
         isRefreshing = true
-        defer { isRefreshing = false }
+        defer {
+            if clientGeneration == gen {
+                isRefreshing = false
+            }
+        }
 
         let allowReclaim = credentialState.effectiveReclaimFlag(silentPoll: silent)
 
@@ -846,6 +924,7 @@ final class RouterViewModel {
                 reclaimIfDuplicate: allowReclaim,
                 includeStationLists: needStations
             )
+            guard clientGeneration == gen else { return }
             credentialState.noteRouterInteractionResult(error: nil)
             if needStations {
                 lastStationFetchAt = Date()
@@ -858,6 +937,7 @@ final class RouterViewModel {
             self.lastError = nil
             self.isSessionOccupied = false
         } catch let routerError as ZTERouterError {
+            guard clientGeneration == gen else { return }
             credentialState.noteRouterInteractionResult(error: routerError)
             switch routerError {
             case .duplicateUser:
@@ -872,6 +952,7 @@ final class RouterViewModel {
                 }
             }
         } catch {
+            guard clientGeneration == gen else { return }
             if !silent || self.snapshot == nil {
                 self.lastError = error.localizedDescription
             }

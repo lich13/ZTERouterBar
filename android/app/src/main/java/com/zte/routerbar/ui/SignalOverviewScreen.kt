@@ -248,9 +248,9 @@ private fun ProfileAndGatewayBar(
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
+        horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        Box {
+        Box(modifier = Modifier.weight(1f, fill = false).padding(end = 8.dp)) {
             Surface(
                 shape = RoundedCornerShape(8.dp),
                 color = MaterialTheme.colorScheme.surfaceVariant,
@@ -273,7 +273,8 @@ private fun ProfileAndGatewayBar(
                         text = uiState.activeProfile.name,
                         style = MaterialTheme.typography.labelLarge,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
                     )
                     Icon(
                         imageVector = AppIcons.ChevronDown,
@@ -310,8 +311,6 @@ private fun ProfileAndGatewayBar(
                 )
             }
         }
-
-        Spacer(modifier = Modifier.weight(1f))
 
         val gw = uiState.wifiGatewayIp
         val gwMatched = uiState.matchedProfileForGateway != null
@@ -404,7 +403,12 @@ private fun InlineQuickSetupCard(
                     modifier = Modifier.weight(1f)
                 )
                 if (!uiState.wifiGatewayIp.isNullOrBlank()) {
-                    OutlinedButton(onClick = { quickUrl = "http://${uiState.wifiGatewayIp}" }) {
+                    OutlinedButton(
+                        onClick = { quickUrl = "http://${uiState.wifiGatewayIp}" },
+                        modifier = Modifier
+                            .padding(top = 6.dp)
+                            .heightIn(min = LayoutSpec.MIN_TOUCH_TARGET_DP.dp)
+                    ) {
                         Text("用当前网关")
                     }
                 }
@@ -551,18 +555,22 @@ private fun WanReconnectHeroCard(
                     Text(
                         text = SignalEvaluator.headerSignalText(snap),
                         style = MaterialTheme.typography.labelMedium.tabularNums().copy(fontWeight = FontWeight.SemiBold),
-                        color = toneColor(gradeTone)
+                        color = toneColor(gradeTone),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                     Spacer(modifier = Modifier.weight(1f))
                     Text(
                         text = "终端 ${snap.totalConnectedDevices} 台",
                         style = MaterialTheme.typography.labelMedium.tabularNums(),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1
                     )
                     Text(
                         text = Formatters.duration(snap.sessionDurationSeconds),
                         style = MaterialTheme.typography.labelMedium.tabularNums(),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1
                     )
                 }
             }

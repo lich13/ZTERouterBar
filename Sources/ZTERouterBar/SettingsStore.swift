@@ -271,11 +271,31 @@ enum KeychainPasswordStore {
             kSecValueData as String: data
         ]
         let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if updateStatus == errSecItemNotFound {
-            var newItem = query
-            newItem[kSecValueData as String] = data
-            return SecItemAdd(newItem as CFDictionary, nil)
+        if updateStatus == errSecSuccess {
+            return errSecSuccess
         }
+        var newItem = query
+        newItem[kSecValueData as String] = data
+        if updateStatus == errSecItemNotFound {
+            let addStatus = SecItemAdd(newItem as CFDictionary, nil)
+            if addStatus != errSecSuccess {
+                logger.warning("Keychain add returned status=\(addStatus, privacy: .public) for profile=\(account, privacy: .public)")
+            }
+            return addStatus
+        }
+        // When explicitly saving a new password over an item created under a prior ad-hoc cdhash ACL,
+        // replace via delete + add unless the user explicitly canceled the system dialog.
+        if updateStatus != errSecUserCanceled {
+            let delStatus = SecItemDelete(query as CFDictionary)
+            if delStatus == errSecSuccess || delStatus == errSecItemNotFound {
+                let addStatus = SecItemAdd(newItem as CFDictionary, nil)
+                if addStatus != errSecSuccess {
+                    logger.warning("Keychain replace add returned status=\(addStatus, privacy: .public) for profile=\(account, privacy: .public)")
+                }
+                return addStatus
+            }
+        }
+        logger.warning("Keychain update returned status=\(updateStatus, privacy: .public) for profile=\(account, privacy: .public)")
         return updateStatus
     }
 

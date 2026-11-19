@@ -140,6 +140,89 @@ class RouterViewModelTest {
         assertFalse(vm.uiState.value.showDiscardDialog)
         assertEquals("默认路由器", vm.uiState.value.draftName)
     }
+
+    @Test
+    fun stagingNewProfileNeverLeaksOrphanOnDiscardAndProfileSwitchCancelsStalePoll() = runTest {
+        val p1 = RouterProfile(id = "p1", name = "热点 1", routerUrlString = "http://192.168.8.1")
+        val p2 = RouterProfile(id = "p2", name = "热点 2", routerUrlString = "http://192.168.0.1")
+        val profileRepo = FakeProfileRepo(
+            StoredAppSettings(profiles = listOf(p1, p2), activeProfileId = "p1", autoMatchByGateway = true, pollingIntervalSec = 3)
+        )
+        val credRepo = FakeCredentialRepo(mutableMapOf("p1" to "pw1", "p2" to "pw2"))
+        val wifi = FakeWifiMonitor(WifiLanState(isWifiConnected = true, gatewayIpv4 = "192.168.8.1", networkHandle = 101L))
+        val slowBackend1 = FakeRouterBackend(wanIpv4 = "10.8.8.8")
+        val fastBackend2 = FakeRouterBackend(wanIpv4 = "10.0.0.2")
+
+        val vm = RouterViewModel(
+            profileRepo = profileRepo,
+            credentialRepo = credRepo,
+            wifiMonitor = wifi,
+            clientFactory = { cfg, pw ->
+                val isP1 = cfg.host == "192.168.8.1"
+                ZteRouterClient(
+                    config = cfg,
+                    password = pw,
+                    transport = { req ->
+                        if (isP1) {
+                            delay(5_000L)
+                            slowBackend1.handle(req)
+                        } else {
+                            fastBackend2.handle(req)
+                        }
+                    },
+                    clockMs = { testScheduler.currentTime },
+                    delayFn = { delay(it) }
+                )
+            },
+            clockMs = { testScheduler.currentTime },
+            delayFn = { delay(it) },
+            externalScope = backgroundScope
+        )
+        runCurrent()
+
+        // Start foreground: p1 poll is stalled on slow 5s socket (isRefreshing = true).
+        vm.setForegroundActive(true)
+        advanceTimeBy(500L)
+        runCurrent()
+        assertTrue(vm.uiState.value.isRefreshing)
+
+        // Roaming to 192.168.0.1 cancels p1's slow poll immediately and connects p2 without being blocked or clobbered.
+        wifi.emit(WifiLanState(isWifiConnected = true, gatewayIpv4 = "192.168.0.1", networkHandle = 202L))
+        runCurrent()
+        assertEquals("p2", vm.uiState.value.activeProfileId)
+        assertEquals("10.0.0.2", vm.uiState.value.snapshot?.wanIPv4)
+
+        advanceTimeBy(6_000L)
+        runCurrent()
+        assertEquals("10.0.0.2", vm.uiState.value.snapshot?.wanIPv4)
+
+        // + 新增配置 stages a draft without persisting an orphan profile when discarded.
+        vm.openProfileSheet()
+        vm.addNewProfileDraft()
+        assertTrue(vm.uiState.value.isEditingUnsavedNewProfile)
+        assertEquals(2, profileRepo.load().profiles.size)
+
+        vm.updateDraftName("临时未保存路由")
+        assertTrue(vm.uiState.value.hasUnsavedDraftChanges)
+        vm.requestCloseProfileSheet()
+        assertTrue(vm.uiState.value.showDiscardDialog)
+        vm.confirmDiscardProfileChanges()
+        assertFalse(vm.uiState.value.isProfileSheetOpen)
+        assertEquals(2, profileRepo.load().profiles.size)
+
+        // Intra-sheet profile selection also guards unsaved draft edits before switching.
+        vm.openProfileSheet()
+        assertEquals("p2", vm.uiState.value.editingProfileId)
+        vm.updateDraftUrl("http://192.168.0.254")
+        assertTrue(vm.uiState.value.hasUnsavedDraftChanges)
+        vm.selectProfileForEditing("p1")
+        assertTrue(vm.uiState.value.showDiscardDialog)
+        assertEquals("p2", vm.uiState.value.editingProfileId)
+        vm.confirmDiscardProfileChanges()
+        assertFalse(vm.uiState.value.showDiscardDialog)
+        assertEquals("p1", vm.uiState.value.editingProfileId)
+        assertEquals("热点 1", vm.uiState.value.draftName)
+    }
 }
 
 private class FakeProfileRepo(initial: StoredAppSettings) : ProfileRepository {

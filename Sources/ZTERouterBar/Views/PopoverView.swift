@@ -172,9 +172,9 @@ struct PopoverView: View {
                 .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 6))
             }
             .menuStyle(.borderlessButton)
-            .fixedSize()
+            .layoutPriority(0)
 
-            Spacer()
+            Spacer(minLength: 8)
 
             if let ssid = viewModel.wifiMonitor.currentSSID {
                 HStack(spacing: 4) {
@@ -188,6 +188,7 @@ struct PopoverView: View {
                 .padding(.horizontal, 7)
                 .padding(.vertical, 3)
                 .background(.quaternary.opacity(0.45), in: Capsule())
+                .layoutPriority(1)
                 .help(viewModel.matchedProfileForCurrentWiFi != nil ? "已自动匹配当前 Wi-Fi 配置" : "当前 Wi-Fi 未绑定配置，可在设置中一键绑定")
             } else if !viewModel.wifiMonitor.isLocationAuthorized {
                 Button {

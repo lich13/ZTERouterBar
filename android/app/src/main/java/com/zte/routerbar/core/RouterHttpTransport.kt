@@ -7,6 +7,7 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
 
 data class RouterHttpRequest(
@@ -63,6 +64,9 @@ class HttpUrlConnectionTransport(
         val uri = parsedUrl.toURI()
         val boundNetwork = networkProvider()
         val connection = ((boundNetwork?.openConnection(parsedUrl) ?: parsedUrl.openConnection()) as HttpURLConnection)
+        val cancelHandle = coroutineContext[Job]?.invokeOnCancellation {
+            runCatching { connection.disconnect() }
+        }
 
         try {
             connection.requestMethod = request.method
@@ -108,6 +112,7 @@ class HttpUrlConnectionTransport(
                 headers = cleanHeaders
             )
         } finally {
+            cancelHandle?.dispose()
             connection.disconnect()
         }
     }

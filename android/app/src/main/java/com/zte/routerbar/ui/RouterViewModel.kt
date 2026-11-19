@@ -25,6 +25,7 @@ import com.zte.routerbar.data.CredentialRepository
 import com.zte.routerbar.data.ProfileRepository
 import com.zte.routerbar.data.StoredAppSettings
 import com.zte.routerbar.data.WifiLanMonitor
+import com.zte.routerbar.data.WifiLanState
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -66,11 +67,14 @@ data class RouterUiState(
     val showDiscardDialog: Boolean = false,
     val editingProfileId: String = "",
     val draftName: String = "",
+    val draftInitialName: String = "",
     val draftUrl: String = "",
+    val draftInitialUrl: String = "",
     val draftPassword: String = "",
     val draftInitialPassword: String = "",
     val draftHasStoredPassword: Boolean = false,
-    val draftHashPreference: AuthHashPreference = AuthHashPreference.AUTO
+    val draftHashPreference: AuthHashPreference = AuthHashPreference.AUTO,
+    val draftInitialHashPreference: AuthHashPreference = AuthHashPreference.AUTO
 ) {
     val activeProfile: RouterProfile
         get() = profiles.firstOrNull { it.id == activeProfileId }
@@ -79,14 +83,14 @@ data class RouterUiState(
     val matchedProfileForGateway: RouterProfile?
         get() = RouterProfileMatcher.matchByGateway(wifiGatewayIp, profiles, activeProfileId)
 
+    val isEditingUnsavedNewProfile: Boolean
+        get() = editingProfileId.isNotEmpty() && profiles.none { it.id == editingProfileId }
+
     val hasUnsavedDraftChanges: Boolean
-        get() {
-            val saved = profiles.firstOrNull { it.id == editingProfileId } ?: return draftName.isNotBlank() || draftPassword.isNotBlank()
-            return draftName != saved.name ||
-                draftUrl != saved.routerUrlString ||
-                draftHashPreference != saved.hashPreference ||
-                draftPassword != draftInitialPassword
-        }
+        get() = draftName != draftInitialName ||
+            draftUrl != draftInitialUrl ||
+            draftHashPreference != draftInitialHashPreference ||
+            draftPassword != draftInitialPassword
 }
 
 class RouterViewModel(
@@ -113,12 +117,15 @@ class RouterViewModel(
 
     private var activeClient: ZteRouterClient? = null
     private var activePassword: String = ""
+    private var clientGeneration: Int = 0
     private var pollingJob: Job? = null
     private var toastClearJob: Job? = null
     private var isForegroundActive: Boolean = false
     private var needsInitialSessionReclaim: Boolean = true
     private var lastStationFetchAtMs: Long? = null
     private var lastObservedGateway: String? = null
+    private var lastObservedNetworkHandle: Long? = null
+    private var pendingAfterDiscard: (() -> Unit)? = null
 
     init {
         val loaded = profileRepo.load()
@@ -134,17 +141,20 @@ class RouterViewModel(
             hasStoredPassword = initialPassword.isNotEmpty(),
             editingProfileId = active.id,
             draftName = active.name,
+            draftInitialName = active.name,
             draftUrl = active.routerUrlString,
+            draftInitialUrl = active.routerUrlString,
             draftPassword = initialPassword,
             draftInitialPassword = initialPassword,
             draftHasStoredPassword = initialPassword.isNotEmpty(),
-            draftHashPreference = active.hashPreference
+            draftHashPreference = active.hashPreference,
+            draftInitialHashPreference = active.hashPreference
         )
         rebuildClient()
 
         scope.launch {
             wifiMonitor.state.collect { wifi ->
-                handleWifiStateChanged(wifi.isWifiConnected, wifi.gatewayIpv4)
+                handleWifiStateChanged(wifi)
             }
         }
     }
@@ -210,14 +220,15 @@ class RouterViewModel(
         if (announce != null) {
             showToast(announce)
         }
-        if (password.isNotEmpty() && isForegroundActive) {
-            scope.launch { refreshNow(silent = false) }
+        if (isForegroundActive) {
+            startPollingLoop()
         }
     }
 
     // MARK: - Profile Sheet & Draft Lifecycle
 
     fun openProfileSheet() {
+        pendingAfterDiscard = null
         val active = _uiState.value.activeProfile
         loadProfileIntoDraft(active)
         _uiState.update { it.copy(isProfileSheetOpen = true, showDiscardDialog = false) }
@@ -227,52 +238,104 @@ class RouterViewModel(
         val state = _uiState.value
         if (state.isSavingProfile) return
         if (state.hasUnsavedDraftChanges) {
+            pendingAfterDiscard = {
+                val active = _uiState.value.activeProfile
+                loadProfileIntoDraft(active)
+                _uiState.update { it.copy(isProfileSheetOpen = false, showDiscardDialog = false) }
+            }
             _uiState.update { it.copy(showDiscardDialog = true) }
         } else {
+            val active = _uiState.value.activeProfile
+            loadProfileIntoDraft(active)
             _uiState.update { it.copy(isProfileSheetOpen = false, showDiscardDialog = false) }
         }
     }
 
     fun dismissDiscardDialog() {
+        pendingAfterDiscard = null
         _uiState.update { it.copy(showDiscardDialog = false) }
     }
 
     fun confirmDiscardProfileChanges() {
-        val active = _uiState.value.activeProfile
-        loadProfileIntoDraft(active)
-        _uiState.update { it.copy(isProfileSheetOpen = false, showDiscardDialog = false) }
+        val action = pendingAfterDiscard
+        pendingAfterDiscard = null
+        if (action != null) {
+            action()
+        } else {
+            val active = _uiState.value.activeProfile
+            loadProfileIntoDraft(active)
+            _uiState.update { it.copy(isProfileSheetOpen = false, showDiscardDialog = false) }
+        }
     }
 
     fun selectProfileForEditing(profileId: String) {
-        val profile = _uiState.value.profiles.firstOrNull { it.id == profileId } ?: return
-        loadProfileIntoDraft(profile)
+        val state = _uiState.value
+        if (state.isSavingProfile || state.editingProfileId == profileId) return
+        val profile = state.profiles.firstOrNull { it.id == profileId } ?: return
+        if (state.hasUnsavedDraftChanges) {
+            pendingAfterDiscard = {
+                loadProfileIntoDraft(profile)
+                _uiState.update { it.copy(showDiscardDialog = false, lastError = null) }
+            }
+            _uiState.update { it.copy(showDiscardDialog = true) }
+        } else {
+            loadProfileIntoDraft(profile)
+        }
+    }
+
+    fun selectProfileFromSheet(profileId: String) {
+        val state = _uiState.value
+        if (state.isSavingProfile) return
+        val target = state.profiles.firstOrNull { it.id == profileId } ?: return
+        if (state.hasUnsavedDraftChanges) {
+            pendingAfterDiscard = {
+                selectProfile(target.id)
+                loadProfileIntoDraft(target)
+                _uiState.update { it.copy(showDiscardDialog = false) }
+            }
+            _uiState.update { it.copy(showDiscardDialog = true) }
+        } else {
+            selectProfile(target.id)
+            loadProfileIntoDraft(target)
+        }
     }
 
     fun addNewProfileDraft() {
         val current = _uiState.value
+        if (current.isSavingProfile) return
+        if (current.hasUnsavedDraftChanges) {
+            pendingAfterDiscard = {
+                stageUnsavedNewProfileDraft()
+            }
+            _uiState.update { it.copy(showDiscardDialog = true) }
+            return
+        }
+        stageUnsavedNewProfileDraft()
+    }
+
+    private fun stageUnsavedNewProfileDraft() {
+        val current = _uiState.value
         val index = current.profiles.size + 1
         val suggestedGateway = current.wifiGatewayIp?.takeIf { it.isNotBlank() } ?: "192.168.8.1"
-        val created = RouterProfile(
-            id = UUID.randomUUID().toString(),
-            name = "路由器配置 $index",
-            routerUrlString = "http://$suggestedGateway",
-            hashPreference = AuthHashPreference.AUTO
-        )
-        val updatedProfiles = current.profiles + created
+        val suggestedName = "路由器配置 $index"
+        val suggestedUrl = "http://$suggestedGateway"
+        val draftId = UUID.randomUUID().toString()
         _uiState.update {
             it.copy(
-                profiles = updatedProfiles,
-                editingProfileId = created.id,
-                draftName = created.name,
-                draftUrl = created.routerUrlString,
+                editingProfileId = draftId,
+                draftName = suggestedName,
+                draftInitialName = suggestedName,
+                draftUrl = suggestedUrl,
+                draftInitialUrl = suggestedUrl,
                 draftPassword = "",
                 draftInitialPassword = "",
                 draftHasStoredPassword = false,
                 draftHashPreference = AuthHashPreference.AUTO,
+                draftInitialHashPreference = AuthHashPreference.AUTO,
+                showDiscardDialog = false,
                 lastError = null
             )
         }
-        persistSettings()
     }
 
     fun deleteProfile(profileId: String) {
@@ -283,22 +346,29 @@ class RouterViewModel(
         credentialRepo.deletePassword(profileId)
 
         val nextActive = if (current.activeProfileId == profileId) remaining.first() else current.activeProfile
-        val nextEditing = if (current.editingProfileId == profileId) nextActive else {
-            remaining.firstOrNull { it.id == current.editingProfileId } ?: nextActive
-        }
-        val editPw = credentialRepo.readPassword(nextEditing.id).orEmpty()
-
-        _uiState.update {
-            it.copy(
-                profiles = remaining,
-                editingProfileId = nextEditing.id,
-                draftName = nextEditing.name,
-                draftUrl = nextEditing.routerUrlString,
-                draftPassword = editPw,
-                draftInitialPassword = editPw,
-                draftHasStoredPassword = editPw.isNotEmpty(),
-                draftHashPreference = nextEditing.hashPreference
-            )
+        val keepStagedNew = current.isEditingUnsavedNewProfile && current.editingProfileId != profileId
+        if (keepStagedNew) {
+            _uiState.update { it.copy(profiles = remaining) }
+        } else {
+            val nextEditing = if (current.editingProfileId == profileId) nextActive else {
+                remaining.firstOrNull { it.id == current.editingProfileId } ?: nextActive
+            }
+            val editPw = credentialRepo.readPassword(nextEditing.id).orEmpty()
+            _uiState.update {
+                it.copy(
+                    profiles = remaining,
+                    editingProfileId = nextEditing.id,
+                    draftName = nextEditing.name,
+                    draftInitialName = nextEditing.name,
+                    draftUrl = nextEditing.routerUrlString,
+                    draftInitialUrl = nextEditing.routerUrlString,
+                    draftPassword = editPw,
+                    draftInitialPassword = editPw,
+                    draftHasStoredPassword = editPw.isNotEmpty(),
+                    draftHashPreference = nextEditing.hashPreference,
+                    draftInitialHashPreference = nextEditing.hashPreference
+                )
+            }
         }
         if (current.activeProfileId == profileId) {
             selectProfile(nextActive.id)
@@ -312,21 +382,21 @@ class RouterViewModel(
     }
 
     fun updateDraftUrl(value: String) {
-        _uiState.update { it.copy(draftUrl = value) }
+        _uiState.update { it.copy(draftUrl = value, lastError = null) }
     }
 
     fun updateDraftPassword(value: String) {
-        _uiState.update { it.copy(draftPassword = value) }
+        _uiState.update { it.copy(draftPassword = value, lastError = null) }
     }
 
     fun updateDraftHashPreference(pref: AuthHashPreference) {
-        _uiState.update { it.copy(draftHashPreference = pref) }
+        _uiState.update { it.copy(draftHashPreference = pref, lastError = null) }
     }
 
     fun fillCurrentGatewayIntoDraft() {
         val gw = _uiState.value.wifiGatewayIp?.trim().orEmpty()
         if (gw.isNotEmpty()) {
-            _uiState.update { it.copy(draftUrl = "http://$gw") }
+            _uiState.update { it.copy(draftUrl = "http://$gw", lastError = null) }
         }
     }
 
@@ -430,11 +500,14 @@ class RouterViewModel(
                     isSessionOccupied = false,
                     editingProfileId = profile.id,
                     draftName = profile.name,
+                    draftInitialName = profile.name,
                     draftUrl = profile.routerUrlString,
+                    draftInitialUrl = profile.routerUrlString,
                     draftPassword = effectivePassword,
                     draftInitialPassword = effectivePassword,
                     draftHasStoredPassword = effectivePassword.isNotEmpty(),
-                    draftHashPreference = profile.hashPreference
+                    draftHashPreference = profile.hashPreference,
+                    draftInitialHashPreference = profile.hashPreference
                 )
             }
             persistSettings()
@@ -453,13 +526,25 @@ class RouterViewModel(
             }
         } finally {
             _uiState.update { it.copy(isSavingProfile = false) }
+            if (isForegroundActive && pollingJob == null) {
+                startPollingLoop(delayFirstPoll = true)
+            }
         }
     }
 
     // MARK: - Refresh & One-Click WAN Reconnect
 
     suspend fun refreshNow(silent: Boolean = false) {
-        if (_uiState.value.isRefreshing) return
+        val entryGen = clientGeneration
+        if (_uiState.value.isRefreshing) {
+            if (silent) return
+            for (i in 0 until 20) {
+                if (!_uiState.value.isRefreshing || clientGeneration != entryGen) break
+                delayFn(100L)
+            }
+            if (_uiState.value.isRefreshing) return
+        }
+        val gen = clientGeneration
         val client = activeClient
         if (client == null) {
             if (!silent) {
@@ -486,6 +571,7 @@ class RouterViewModel(
                 reclaimIfDuplicate = allowReclaim,
                 includeStationLists = needStations
             )
+            if (clientGeneration != gen) return
             needsInitialSessionReclaim = false
 
             if (needStations) {
@@ -511,6 +597,7 @@ class RouterViewModel(
         } catch (ce: CancellationException) {
             throw ce
         } catch (routerErr: ZteRouterException) {
+            if (clientGeneration != gen) return
             if (routerErr !is ZteRouterException.TransportError) {
                 needsInitialSessionReclaim = false
             }
@@ -530,11 +617,14 @@ class RouterViewModel(
                 }
             }
         } catch (err: Exception) {
+            if (clientGeneration != gen) return
             if (!silent || _uiState.value.snapshot == null) {
                 _uiState.update { it.copy(lastError = err.message ?: "状态刷新异常") }
             }
         } finally {
-            _uiState.update { it.copy(isRefreshing = false) }
+            if (clientGeneration == gen) {
+                _uiState.update { it.copy(isRefreshing = false) }
+            }
         }
     }
 
@@ -623,9 +713,14 @@ class RouterViewModel(
 
     // MARK: - Internal Helpers
 
-    private fun startPollingLoop() {
+    private fun startPollingLoop(delayFirstPoll: Boolean = false) {
         pollingJob?.cancel()
         pollingJob = scope.launch {
+            if (delayFirstPoll) {
+                val initialState = _uiState.value
+                val baseMs = initialState.pollingIntervalSec * 1_000L
+                delayFn(if (initialState.isSessionOccupied) maxOf(15_000L, baseMs * 4L) else baseMs)
+            }
             while (isActive && isForegroundActive) {
                 if (activePassword.isNotEmpty()) {
                     refreshNow(silent = true)
@@ -643,10 +738,13 @@ class RouterViewModel(
         pollingJob = null
     }
 
-    private fun handleWifiStateChanged(connected: Boolean, gatewayIp: String?) {
-        val normalizedGw = gatewayIp?.trim()?.takeIf { it.isNotEmpty() }
+    private fun handleWifiStateChanged(wifi: WifiLanState) {
+        val connected = wifi.isWifiConnected
+        val normalizedGw = wifi.gatewayIpv4?.trim()?.takeIf { it.isNotEmpty() }
         val gatewayChanged = normalizedGw != null && normalizedGw != lastObservedGateway
+        val networkChanged = wifi.networkHandle != null && wifi.networkHandle != lastObservedNetworkHandle
         lastObservedGateway = normalizedGw
+        lastObservedNetworkHandle = wifi.networkHandle
 
         _uiState.update {
             it.copy(
@@ -655,12 +753,20 @@ class RouterViewModel(
             )
         }
 
-        if (connected && normalizedGw != null) {
-            val switched = applyGatewayAutoMatchIfNeeded(normalizedGw)
-            if (!switched && gatewayChanged && activePassword.isNotEmpty()) {
-                needsInitialSessionReclaim = true
-                if (isForegroundActive) {
-                    scope.launch { refreshNow(silent = true) }
+        if (connected) {
+            val switched = if (normalizedGw != null) applyGatewayAutoMatchIfNeeded(normalizedGw) else false
+            if (!switched && activePassword.isNotEmpty()) {
+                if (gatewayChanged) {
+                    needsInitialSessionReclaim = true
+                }
+                if (networkChanged && _uiState.value.isRefreshing && _uiState.value.snapshot == null) {
+                    // Abort an initial unbound (cellular/VPN) or stale-network socket stall immediately.
+                    rebuildClient()
+                    if (isForegroundActive) {
+                        startPollingLoop()
+                    }
+                } else if (gatewayChanged && isForegroundActive) {
+                    startPollingLoop()
                 }
             }
         }
@@ -682,16 +788,23 @@ class RouterViewModel(
             it.copy(
                 editingProfileId = profile.id,
                 draftName = profile.name,
+                draftInitialName = profile.name,
                 draftUrl = profile.routerUrlString,
+                draftInitialUrl = profile.routerUrlString,
                 draftPassword = pw,
                 draftInitialPassword = pw,
                 draftHasStoredPassword = pw.isNotEmpty(),
-                draftHashPreference = profile.hashPreference
+                draftHashPreference = profile.hashPreference,
+                draftInitialHashPreference = profile.hashPreference
             )
         }
     }
 
     private fun rebuildClient() {
+        stopPollingLoop()
+        clientGeneration += 1
+        lastStationFetchAtMs = null
+        _uiState.update { it.copy(isRefreshing = false) }
         val profile = _uiState.value.activeProfile
         try {
             val config = RouterEndpointConfig.parse(profile.routerUrlString, profile.hashPreference)

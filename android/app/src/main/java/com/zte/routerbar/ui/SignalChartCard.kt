@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CardDefaults
@@ -197,8 +198,9 @@ fun SignalQualityChartCard(
                 ) {
                     Column(
                         modifier = Modifier
+                            .width(LayoutSpec.CHART_Y_AXIS_WIDTH_DP.dp)
                             .height(LayoutSpec.CHART_HEIGHT_DP.dp)
-                            .padding(end = 6.dp),
+                            .padding(end = 4.dp),
                         verticalArrangement = Arrangement.SpaceBetween,
                         horizontalAlignment = Alignment.End
                     ) {
@@ -207,7 +209,8 @@ fun SignalQualityChartCard(
                             Text(
                                 text = tick.toInt().toString(),
                                 style = MaterialTheme.typography.labelSmall.tabularNums(),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1
                             )
                         }
                     }
@@ -257,11 +260,14 @@ fun SignalQualityChartCard(
                         }
 
                         val count = plottedValues.size
-                        val coords = plottedValues.mapIndexed { idx, (_, value) ->
-                            val x = if (count == 1) {
-                                padH + plotW * 0.5f
-                            } else {
-                                padH + plotW * (idx.toFloat() / (count - 1).toFloat())
+                        val tMin = plottedValues.first().first
+                        val tMax = plottedValues.last().first
+                        val tSpan = tMax - tMin
+                        val coords = plottedValues.mapIndexed { idx, (ts, value) ->
+                            val x = when {
+                                count == 1 -> padH + plotW * 0.5f
+                                tSpan > 0L -> padH + plotW * ((ts - tMin).toFloat() / tSpan.toFloat())
+                                else -> padH + plotW * (idx.toFloat() / (count - 1).toFloat())
                             }
                             x to mapY(value)
                         }
@@ -300,11 +306,52 @@ fun SignalQualityChartCard(
                             )
                         }
 
-                        val lastPt = coords.last()
-                        drawCircle(
-                            color = lineColor,
-                            radius = 4.dp.toPx(),
-                            center = Offset(lastPt.first, lastPt.second)
+                        if (coords.size <= 2) {
+                            coords.forEachIndexed { idx, pt ->
+                                val r = if (idx == coords.lastIndex) 4.dp.toPx() else 3.dp.toPx()
+                                drawCircle(
+                                    color = lineColor,
+                                    radius = r,
+                                    center = Offset(pt.first, pt.second)
+                                )
+                            }
+                        } else {
+                            val lastPt = coords.last()
+                            drawCircle(
+                                color = lineColor,
+                                radius = 4.dp.toPx(),
+                                center = Offset(lastPt.first, lastPt.second)
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = LayoutSpec.CHART_Y_AXIS_WIDTH_DP.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = Formatters.timeOfDay(plottedValues.first().first),
+                        style = MaterialTheme.typography.labelSmall.tabularNums(),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = "基准: ${thresholds.joinToString(" / ") { it.label }}",
+                        style = MaterialTheme.typography.labelSmall.tabularNums(),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (plottedValues.size > 1) {
+                        Text(
+                            text = Formatters.timeOfDay(plottedValues.last().first),
+                            style = MaterialTheme.typography.labelSmall.tabularNums(),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1
                         )
                     }
                 }

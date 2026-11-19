@@ -160,6 +160,66 @@ class ZteRouterClientTest {
         assertNull(jarB.cookieHeaderFor(URI("http://192.168.8.1/goform/goform_get_cmd_process")))
     }
 
+    @Test
+    fun reloginUsesActualPreLoginVersionFieldsForAdWhileKeepingCachedModelAlgorithm() = runTest {
+        var loggedIn = false
+        val loginAds = mutableListOf<String>()
+        val transport = RouterHttpTransport { req ->
+            if (req.method == "GET") {
+                val query = URI(req.url).rawQuery.orEmpty()
+                val cmd = query.split("&").firstOrNull { it.startsWith("cmd=") }?.removePrefix("cmd=").orEmpty()
+                val obj = JSONObject()
+                for (k in cmd.split(",")) {
+                    val v = when (k) {
+                        // Firmware masks wa_inner_version before login, exposes legacy MD5 model after login.
+                        "wa_inner_version" -> if (loggedIn) "BD_MC801AV1.0.0B01" else ""
+                        "cr_version" -> ""
+                        "RD" -> "RD_TOKEN"
+                        "LD" -> "LD_TOKEN"
+                        "loginfo" -> if (loggedIn) "ok" else ""
+                        "ppp_status" -> if (loggedIn) "ppp_connected" else ""
+                        "network_type" -> if (loggedIn) "LTE" else ""
+                        else -> ""
+                    }
+                    obj.put(k, v)
+                }
+                RouterHttpResponse(200, obj.toString().toByteArray(Charsets.UTF_8))
+            } else {
+                val body = req.body?.toString(Charsets.UTF_8).orEmpty()
+                val ad = body.split("&")
+                    .firstOrNull { it.startsWith("AD=") }
+                    ?.removePrefix("AD=")
+                    ?.let { URLDecoder.decode(it, Charsets.UTF_8.name()) }
+                    .orEmpty()
+                loginAds.add(ad)
+                loggedIn = true
+                RouterHttpResponse(200, """{"result":"0"}""".toByteArray(Charsets.UTF_8))
+            }
+        }
+
+        val client = ZteRouterClient(
+            config = RouterEndpointConfig.parse("http://192.168.8.1", AuthHashPreference.AUTO),
+            password = "pw",
+            transport = transport,
+            delayFn = {}
+        )
+
+        // First poll:wa_inner_version="" -> defaults to SHA256("") + RD_TOKEN, then caches BD_MC801AV1.0.0B01.
+        assertEquals("LTE", client.fetchStatus(includeStationLists = false).networkType)
+        assertEquals(
+            RouterCrypto.computeAD("", "", "RD_TOKEN", ResolvedHashAlgorithm.SHA256),
+            loginAds[0]
+        )
+
+        // Expire session: second LOGIN resolves MD5 from cached BD_MC801A, while hashing actual pre-login wa="" + cr="".
+        loggedIn = false
+        assertEquals("LTE", client.fetchStatus(includeStationLists = false).networkType)
+        assertEquals(
+            RouterCrypto.computeAD("", "", "RD_TOKEN", ResolvedHashAlgorithm.MD5),
+            loginAds[1]
+        )
+    }
+
     private fun loginPostCount(requests: List<RouterHttpRequest>): Int =
         requests.count { req ->
             req.method == "POST" && req.body?.toString(Charsets.UTF_8)?.contains("goformId=LOGIN") == true

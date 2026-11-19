@@ -826,14 +826,16 @@ struct ZTERouterCoreTests {
         #expect(calls[pDefault] == 1)
         #expect(calls[pPocket, default: 0] == 0)
 
-        // Non-GUI event 10s later does not touch Keychain.
+        // Non-GUI event 10s later does not touch Keychain and does not schedule a GUI cooldown timer.
         _ = sm.loadActiveProfile(id: pDefault, isInteractiveGUI: false, now: t0.addingTimeInterval(10)) { id in
             calls[id, default: 0] += 1
             return .found("should-not-run")
         }
         #expect(calls[pDefault] == 1)
+        #expect(sm.nextCooldownRetryDelaySec(now: t0.addingTimeInterval(1.0)) == nil)
 
-        // GUI wake at t0 + 1s: preloads pPocket, while pDefault is still inside the 3s per-profile retry cooldown.
+        // GUI wake at t0 + 1s: preloads pPocket, while pDefault is still inside the 3s per-profile retry cooldown
+        // and exposes the exact remaining cooldown delay (~2.0s) for a one-shot follow-up retry.
         _ = sm.preloadAllProfilesIfNeeded(profileIDs: [pDefault, pPocket], isInteractiveGUI: true, now: t0.addingTimeInterval(1.0)) { id in
             calls[id, default: 0] += 1
             return .found("pw-\(id.uuidString.prefix(4))")
@@ -841,18 +843,29 @@ struct ZTERouterCoreTests {
         #expect(calls[pPocket] == 1)
         #expect(calls[pDefault] == 1)
         #expect(sm.hasPreloadedAllProfilesInGUI == false)
+        let pendingDelay = sm.nextCooldownRetryDelaySec(now: t0.addingTimeInterval(1.0))
+        #expect(pendingDelay != nil && abs((pendingDelay ?? 0) - 2.0) < 0.01)
 
-        // At t0 + 3.2s, cooldown expires and pDefault unlocks; watchdog resumes cleanly.
-        _ = sm.preloadAllProfilesIfNeeded(profileIDs: [pDefault, pPocket], isInteractiveGUI: true, now: t0.addingTimeInterval(3.2)) { id in
+        // Even if loader returns .deferredBySystem when cooldown expires, nextCooldownRetryDelaySec becomes nil (no loop).
+        _ = sm.loadActiveProfile(id: pDefault, isInteractiveGUI: true, now: t0.addingTimeInterval(3.1)) { id in
+            calls[id, default: 0] += 1
+            return .deferredBySystem(-25_308)
+        }
+        #expect(calls[pDefault] == 2)
+        #expect(sm.nextCooldownRetryDelaySec(now: t0.addingTimeInterval(3.1)) == nil)
+
+        // At t0 + 6.2s, cooldown expires and pDefault unlocks; watchdog resumes cleanly.
+        _ = sm.preloadAllProfilesIfNeeded(profileIDs: [pDefault, pPocket], isInteractiveGUI: true, now: t0.addingTimeInterval(6.2)) { id in
             calls[id, default: 0] += 1
             return .found("pw-default")
         }
-        let (readyEval, _) = sm.loadActiveProfile(id: pDefault, isInteractiveGUI: true, now: t0.addingTimeInterval(3.2)) { _ in
+        let (readyEval, _) = sm.loadActiveProfile(id: pDefault, isInteractiveGUI: true, now: t0.addingTimeInterval(6.2)) { _ in
             Issue.record("Expected memory cache hit after GUI preload")
             return .notFound
         }
         #expect(readyEval.password == "pw-default")
         #expect(sm.hasPreloadedAllProfilesInGUI == true)
+        #expect(sm.nextCooldownRetryDelaySec(now: t0.addingTimeInterval(6.2)) == nil)
         #expect(sm.shouldResumeWatchdog(isCredentialReady: true, isWatchdogRunning: false, autoStart: true, userStoppedWatchdog: false) == true)
     }
 

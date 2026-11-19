@@ -4,7 +4,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -147,6 +150,9 @@ fun NrCellsSection(cells: List<NRCellInfo>, screenWidthDp: Int) {
                 row.forEach { cell ->
                     NrCellCard(cell = cell, modifier = Modifier.weight(1f))
                 }
+                repeat(cols - row.size) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
             }
         }
     }
@@ -234,6 +240,9 @@ fun LteCellsSection(cells: List<LTECellInfo>, screenWidthDp: Int) {
             ) {
                 row.forEach { cell ->
                     LteCellCard(cell = cell, modifier = Modifier.weight(1f))
+                }
+                repeat(cols - row.size) {
+                    Spacer(modifier = Modifier.weight(1f))
                 }
             }
         }
@@ -385,12 +394,16 @@ fun NetworkDetailsCard(snap: RouterStatusSnapshot, screenWidthDp: Int) {
                             modifier = Modifier.weight(1f)
                         )
                     }
+                    repeat(pairsPerRow - chunk.size) {
+                        Spacer(modifier = Modifier.weight(1f))
+                    }
                 }
             }
         }
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun NeighborCellsCard(cells: List<NeighborCellInfo>) {
     if (cells.isEmpty()) return
@@ -411,14 +424,15 @@ fun NeighborCellsCard(cells: List<NeighborCellInfo>) {
             )
             cells.forEach { cell ->
                 if (cell.pci.isNotEmpty()) {
-                    Row(
+                    FlowRow(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
                     ) {
-                        Text("PCI: ${cell.pci}", style = MaterialTheme.typography.bodySmall.tabularNums().copy(fontWeight = FontWeight.SemiBold))
-                        Text("Freq: ${cell.frequency}", style = MaterialTheme.typography.bodySmall.tabularNums())
-                        Text("RSRP: ${cell.rsrp} dBm", style = MaterialTheme.typography.bodySmall.tabularNums())
-                        Text("RSRQ: ${cell.rsrq} dB", style = MaterialTheme.typography.bodySmall.tabularNums())
+                        Text("PCI: ${cell.pci}", style = MaterialTheme.typography.bodySmall.tabularNums().copy(fontWeight = FontWeight.SemiBold), maxLines = 1)
+                        Text("Freq: ${cell.frequency}", style = MaterialTheme.typography.bodySmall.tabularNums(), maxLines = 1)
+                        Text("RSRP: ${cell.rsrp} dBm", style = MaterialTheme.typography.bodySmall.tabularNums(), maxLines = 1)
+                        Text("RSRQ: ${cell.rsrq} dB", style = MaterialTheme.typography.bodySmall.tabularNums(), maxLines = 1)
                     }
                 } else {
                     Text(
