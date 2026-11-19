@@ -52,7 +52,7 @@ class RouterViewModelTest {
                 ZteRouterClient(
                     config = cfg,
                     password = pw,
-                    transport = backend::handle,
+                    transport = { req -> backend.handle(req) },
                     clockMs = { testScheduler.currentTime },
                     delayFn = { delay(it) }
                 )
@@ -105,7 +105,7 @@ class RouterViewModelTest {
                 ZteRouterClient(
                     config = cfg,
                     password = pw,
-                    transport = backend::handle,
+                    transport = { req -> backend.handle(req) },
                     clockMs = { testScheduler.currentTime },
                     delayFn = { delay(it) }
                 )

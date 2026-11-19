@@ -67,8 +67,10 @@ class AndroidProfileStore(context: Context) : ProfileRepository {
         }
     }
 
-    override fun save(settings: StoredAppSettings) = synchronized(lock) {
-        writeLocked(settings)
+    override fun save(settings: StoredAppSettings) {
+        synchronized(lock) {
+            writeLocked(settings)
+        }
     }
 
     private fun writeLocked(settings: StoredAppSettings) {

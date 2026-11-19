@@ -270,7 +270,7 @@ data class WANIPSnapshot(
     val isEmpty: Boolean
         get() = normalizedIpv4.isEmpty() && normalizedIpv6.isEmpty()
 
-    fun hasChanged(from previous: WANIPSnapshot): Boolean {
+    fun hasChanged(previous: WANIPSnapshot): Boolean {
         if (normalizedIpv4.isNotEmpty() && previous.normalizedIpv4.isNotEmpty() && normalizedIpv4 != previous.normalizedIpv4) {
             return true
         }
@@ -297,7 +297,7 @@ object WANIPChangeFormatter {
         before: WANIPSnapshot,
         after: WANIPSnapshot
     ): Pair<String, String> {
-        val changed = after.hasChanged(from = before)
+        val changed = after.hasChanged(before)
         val title = when {
             !state.isConnected -> "重连指令已发送（${state.localizedLabel}）"
             changed -> "外网重连完成 · IP 已变更"

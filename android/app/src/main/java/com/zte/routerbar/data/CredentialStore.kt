@@ -50,42 +50,46 @@ class AndroidCredentialStore(context: Context) : CredentialRepository {
         }
     }
 
-    override fun writePassword(profileId: String, password: String) = synchronized(lock) {
-        require(profileId.isNotBlank() && profileId.length <= 256)
-        val trimmed = password.trim()
-        require(trimmed.isNotEmpty() && trimmed.length <= 4096)
+    override fun writePassword(profileId: String, password: String) {
+        synchronized(lock) {
+            require(profileId.isNotBlank() && profileId.length <= 256)
+            val trimmed = password.trim()
+            require(trimmed.isNotEmpty() && trimmed.length <= 4096)
 
-        val id = identity(profileId)
-        val secret = requireNotNull(getOrCreateSecretKey(id, create = true))
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, secret)
-        cipher.updateAAD(profileId.toByteArray(Charsets.UTF_8))
-        val encrypted = cipher.doFinal(trimmed.toByteArray(Charsets.UTF_8))
+            val id = identity(profileId)
+            val secret = requireNotNull(getOrCreateSecretKey(id, create = true))
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, secret)
+            cipher.updateAAD(profileId.toByteArray(Charsets.UTF_8))
+            val encrypted = cipher.doFinal(trimmed.toByteArray(Charsets.UTF_8))
 
-        val payload = JSONObject()
-            .put("iv", Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
-            .put("ciphertext", Base64.encodeToString(encrypted, Base64.NO_WRAP))
-            .toString()
-            .toByteArray(Charsets.UTF_8)
+            val payload = JSONObject()
+                .put("iv", Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+                .put("ciphertext", Base64.encodeToString(encrypted, Base64.NO_WRAP))
+                .toString()
+                .toByteArray(Charsets.UTF_8)
 
-        val target = credentialFile(id)
-        val stream = target.startWrite()
-        try {
-            stream.write(payload)
-            target.finishWrite(stream)
-        } catch (err: Exception) {
-            target.failWrite(stream)
-            throw err
+            val target = credentialFile(id)
+            val stream = target.startWrite()
+            try {
+                stream.write(payload)
+                target.finishWrite(stream)
+            } catch (err: Exception) {
+                target.failWrite(stream)
+                throw err
+            }
         }
     }
 
-    override fun deletePassword(profileId: String) = synchronized(lock) {
-        if (profileId.isBlank()) return
-        val id = identity(profileId)
-        runCatching { credentialFile(id).delete() }
-        runCatching {
-            if (keyStore.containsAlias(alias(id))) {
-                keyStore.deleteEntry(alias(id))
+    override fun deletePassword(profileId: String) {
+        synchronized(lock) {
+            if (profileId.isBlank()) return
+            val id = identity(profileId)
+            runCatching { credentialFile(id).delete() }
+            runCatching {
+                if (keyStore.containsAlias(alias(id))) {
+                    keyStore.deleteEntry(alias(id))
+                }
             }
         }
     }

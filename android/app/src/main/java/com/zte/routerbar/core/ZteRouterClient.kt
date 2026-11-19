@@ -45,16 +45,22 @@ class ZteRouterClient(
         checkLoggedInLocked()
     }
 
-    suspend fun login(reclaimIfDuplicate: Boolean = false) = opMutex.withLock {
-        loginLocked(reclaimIfDuplicate)
+    suspend fun login(reclaimIfDuplicate: Boolean = false) {
+        opMutex.withLock {
+            loginLocked(reclaimIfDuplicate)
+        }
     }
 
-    suspend fun ensureAuthenticated(reclaimIfDuplicate: Boolean = false) = opMutex.withLock {
-        ensureAuthenticatedLocked(reclaimIfDuplicate)
+    suspend fun ensureAuthenticated(reclaimIfDuplicate: Boolean = false) {
+        opMutex.withLock {
+            ensureAuthenticatedLocked(reclaimIfDuplicate)
+        }
     }
 
-    suspend fun keepAliveIfNeeded(intervalMs: Long = 55_000L) = opMutex.withLock {
-        keepAliveIfNeededLocked(intervalMs)
+    suspend fun keepAliveIfNeeded(intervalMs: Long = 55_000L) {
+        opMutex.withLock {
+            keepAliveIfNeededLocked(intervalMs)
+        }
     }
 
     suspend fun fetchStatus(
