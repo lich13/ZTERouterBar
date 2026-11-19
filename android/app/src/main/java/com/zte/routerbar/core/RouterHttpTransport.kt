@@ -6,8 +6,12 @@ import java.net.CookiePolicy
 import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 data class RouterHttpRequest(
@@ -64,8 +68,15 @@ class HttpUrlConnectionTransport(
         val uri = parsedUrl.toURI()
         val boundNetwork = networkProvider()
         val connection = ((boundNetwork?.openConnection(parsedUrl) ?: parsedUrl.openConnection()) as HttpURLConnection)
-        val cancelHandle = coroutineContext[Job]?.invokeOnCancellation {
-            runCatching { connection.disconnect() }
+        val finished = AtomicBoolean(false)
+        val cancelWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                awaitCancellation()
+            } catch (_: CancellationException) {
+                if (!finished.get()) {
+                    runCatching { connection.disconnect() }
+                }
+            }
         }
 
         try {
@@ -112,7 +123,8 @@ class HttpUrlConnectionTransport(
                 headers = cleanHeaders
             )
         } finally {
-            cancelHandle?.dispose()
+            finished.set(true)
+            cancelWatcher.cancel()
             connection.disconnect()
         }
     }
