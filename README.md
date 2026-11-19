@@ -1,6 +1,6 @@
 # ZTERouterBar
 
-基于 **Swift 6 + SwiftUI + AppKit** 的中兴（ZTE）移动热点 / 5G CPE macOS 状态栏助手，支持一键重连外网、实时信号与终端监控，以及多路由器配置的 Wi-Fi 名自动匹配切换。
+支持 **macOS 状态栏（Swift 6 + SwiftUI + AppKit）** 与 **Android 客户端（Kotlin + Jetpack Compose，`arm64-v8a`）** 的中兴（ZTE）移动热点 / 5G CPE 助手，提供零确认一键重连外网、实时蜂窝信号评级与趋势监控，以及多路由器配置自动切换。
 
 ## 核心特性
 
@@ -28,15 +28,23 @@
   - 在已绑定 Wi-Fi 下手动退出后，重新连接该 Wi-Fi 或手动打开才会再次启动
 - **低占用**
   - 状态轮询合并为单个请求（后台每 `10s` 一次），终端列表仅在界面可见时按需获取；弹窗与控制台关闭后即释放界面
+- **Android 原生客户端（`arm64-v8a`，Android 12+）**
+  - 基于 **Kotlin + Jetpack Compose + Material 3**，聚焦「信号与概览」与「零确认一键重连外网」（含重连前后 WAN IPv4/IPv6 变化对比横幅与会话占用接管）
+  - 通过 `ConnectivityManager` 绑定当前 Wi-Fi 局域网通道（绕过无外网时的蜂窝回退及本机 VPN `tun0`），无需申请定位权限即可按 IPv4 网关自动切换多路由器配置
+  - 管理密码通过 `AndroidKeyStore` AES-256-GCM 独立加密存储，禁止云备份与设备迁移提取
 
 ## 本地构建与测试
 
 ```bash
+# macOS
 swift test
-PACKAGE_DMG=1 APP_VERSION=1.2.2 ./scripts/build-app.sh release
+PACKAGE_DMG=1 APP_VERSION=1.3.0 ./scripts/build-app.sh release
+
+# Android (需 JDK 21+ 与 Android SDK)
+cd android && ./gradlew testDebugUnitTest assembleRelease -PappVersion=1.3.0
 ```
 
 ## 隐私说明
 
-- 所有路由器管理密码均通过 macOS 钥匙串（`Keychain`）加密存储，不写入源码或明文配置。
-- Wi-Fi 名称仅在本地用于匹配已保存配置，不会上传到任何第三方服务器。
+- 所有路由器管理密码均通过系统硬件/系统级安全存储（macOS `Keychain` / Android `AndroidKeyStore`）加密保存，不写入源码或明文配置。
+- Wi-Fi 名称与网关信息仅在本地用于匹配已保存配置，不会上传到任何第三方服务器。
