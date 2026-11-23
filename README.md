@@ -17,20 +17,20 @@
   - 支持保存多个路由器配置（名称、地址、管理密码、AD 算法、绑定多个 Wi-Fi SSID）
   - 使用 `CoreWLAN` + `CoreLocation` 识别当前连接的 Wi-Fi 名称，自动切换对应配置与钥匙串凭据
 - **外网限流自动保活守护（Watchdog）与系统通知**
-  - 打开 App 默认自动启动保活守护，默认端点 `661313 204`（`15s` / `3s`）、`YouTube 204`、`Cloudflare DoH`、`Telegram API`（`33s` / `4s`），权重均为 `1`（可达权重须过半：4 个里 2 个不通即算异常），每个端点可独立配置检测频率、超时与权重
-  - **先通知、自动重连为独立开关（默认关闭）**：判为异常后进入确认期，每 `5s` 对全部端点复检，连续 2 次探测不通先推送系统通知（每次异常只通知一次），任一轮恢复即取消；开启「自动重连」后，持续异常满 `60s` 才触发重连
-  - **重连后保护期**：重连完成后 `300s` 内不探测、不判定、不重连，之后从头监测；连续重连 `3` 次仍未恢复则冷却 `300s`。手动重连同样享有保护期，且不会与自动重连同时执行
+  - 打开 App 默认自动启动保活守护，默认端点 `661313 204`（`15s` / `10s`）、`YouTube 204`、`Cloudflare DoH`、`Telegram API`（`33s` / `10s`），权重均为 `1`（可达权重须过半：4 个里 2 个不通即算异常），每个端点可独立配置检测频率、超时与权重
+  - **先通知、自动重连为独立开关（默认关闭）**：判为异常后进入确认期，每 `5s` 对全部端点复检，连续 2 次探测不通先推送系统通知（每次异常只通知一次），任一轮恢复即取消；开启「自动重连」后，持续异常满 `15s` 才触发重连
+  - **重连后保护期**：重连完成后 `180s` 内不探测、不判定、不重连，之后从头监测；连续重连 `3` 次仍未恢复则冷却 `300s`。手动重连同样享有保护期，且不会与自动重连同时执行
   - 探测不通、触发自动重连及每次手动/自动重连前后的 WAN IPv4/IPv6 变化均自动推送 macOS 系统通知
   - **日志**：运行日志按天写入 `~/Library/Logs/ZTERouterBar/watchdog-<日期>.log`，只保留最近 3 天；自动/手动重连的触发原因、结果与 IP 变化单独记录在 `reconnect.log`（不自动清理），重启后仍可在「保活守护」页查看
 - **仅连接已绑定 Wi-Fi 时启动（可选）**
-  - 在「配置与设置 → 启动方式」中选择后，App 平时不常驻：由 launchd 在网络变化时按需检查，连上任一配置绑定的 Wi-Fi 才拉起 App，离开约 `60s` 后自动退出
+  - 在「配置与设置 → 启动方式」中选择后，App 平时不常驻：由 launchd 在网络变化时按需检查，连上任一配置绑定的 Wi-Fi 即时拉起 App；离开绑定 Wi-Fi 时立即暂停后台轮询与守护，切到其他 Wi-Fi 或关闭 Wi-Fi 后约 `1.5s` 自动退出（短暂信号重关联留有 `8s` 漫游缓冲）
   - 实现为用户级 LaunchAgent `~/Library/LaunchAgents/com.zte.routerbar.wifi-trigger.plist`（切回其他启动方式时自动移除；直接删除 App 后需手动删除该文件）
   - 在已绑定 Wi-Fi 下手动退出后，重新连接该 Wi-Fi 或手动打开才会再次启动
 - **低占用**
   - 状态轮询合并为单个请求（后台每 `10s` 一次），终端列表仅在界面可见时按需获取；弹窗与控制台关闭后即释放界面
 - **Android 原生客户端（`arm64-v8a`，Android 12+）**
-  - 基于 **Kotlin + Jetpack Compose + Material 3**，聚焦「信号与概览」与「零确认一键重连外网」（含重连前后 WAN IPv4/IPv6 变化对比横幅与会话占用接管）
-  - 通过 `ConnectivityManager` 绑定当前 Wi-Fi 局域网通道（绕过无外网时的蜂窝回退及本机 VPN `tun0`），无需申请定位权限即可按 IPv4 网关自动切换多路由器配置
+  - 基于 **Kotlin + Jetpack Compose + Material 3**，聚焦「信号与概览」、「零确认一键重连外网」（含重连前后 WAN IPv4/IPv6 变化对比横幅与会话占用接管）与「手动外网节点测速」（内置 `661313 204`、`YouTube 204`、`Cloudflare DoH`、`Telegram API` 四个默认节点并发连通性与延迟检测）
+  - 通过 `ConnectivityManager` 绑定当前 Wi-Fi 局域网通道（绕过无外网时的蜂窝回退及本机 VPN `tun0`，外网节点测速自动识别系统 VPN 分流与 Wi-Fi 直连防蜂窝假阳性），无需申请定位权限即可按 IPv4 网关自动切换多路由器配置
   - 管理密码通过 `AndroidKeyStore` AES-256-GCM 独立加密存储，禁止云备份与设备迁移提取
 
 ## 本地构建与测试
@@ -38,10 +38,10 @@
 ```bash
 # macOS
 swift test
-PACKAGE_DMG=1 APP_VERSION=1.3.2 ./scripts/build-app.sh release
+PACKAGE_DMG=1 APP_VERSION=1.3.3 ./scripts/build-app.sh release
 
 # Android (需 JDK 21+ 与 Android SDK)
-cd android && ./gradlew testDebugUnitTest assembleRelease -PappVersion=1.3.2
+cd android && ./gradlew testDebugUnitTest assembleRelease -PappVersion=1.3.3
 ```
 
 ## 隐私说明

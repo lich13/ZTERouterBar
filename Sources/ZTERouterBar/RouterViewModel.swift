@@ -41,7 +41,9 @@ final class RouterViewModel {
     var isReconnectingWAN: Bool = false
     var isSessionOccupied: Bool = false
     var isUIActive: Bool = false
+    var isBlockingAutoQuit: Bool = false
     var selectedDashboardTab: DashboardTab = .overview
+    var terminateHandler: @MainActor () -> Void = { NSApp.terminate(nil) }
 
     // Watchdog state
     var isWatchdogRunning: Bool = false
@@ -61,6 +63,7 @@ final class RouterViewModel {
     private var watchdogTask: Task<Void, Never>?
     private var deferredCooldownRetryTask: Task<Void, Never>?
     private var clearMessageTask: Task<Void, Never>?
+    private var stalledInitialPollRetryTask: Task<Void, Never>?
     private var userStoppedWatchdog = false
     /// Bumped on every client rebuild so an in-flight poll from a previous profile cannot clobber current state.
     private var clientGeneration = 0
@@ -68,11 +71,15 @@ final class RouterViewModel {
     private var watchdogGeneration = 0
     private var manualReconnectGraceUntil: Date?
     private var lastStationFetchAt: Date?
+    private var currentRefreshStartedAt: ContinuousClock.Instant?
+    private var consecutiveInitialPollFailures = 0
 
-    // "Launch only on bound Wi-Fi": quit after leaving a bound Wi-Fi this run was started on.
-    private var sawBoundWiFi = false
+    // "Launch only on bound Wi-Fi": pause outside bound Wi-Fi and quit promptly once confirmed.
+    private var wifiLifecycle: WiFiOnlyLifecycleStateMachine
     private var leaveQuitTask: Task<Void, Never>?
-    private var leaveQuitDeferredByUI = false
+    private var leaveQuitGeneration = 0
+    private var isActivitySuspendedForUnboundWiFi = false
+    private var watchdogPausedForUnboundWiFi = false
     private var pendingAutoBeforeIP: WANIPSnapshot = WANIPSnapshot()
     private var handledAutoReconnectFinish = false
 
@@ -88,12 +95,14 @@ final class RouterViewModel {
     init(
         settings: SettingsStore = SettingsStore(),
         wifiMonitor: WiFiNetworkMonitor = WiFiNetworkMonitor(),
-        notifier: SystemNotificationManager = SystemNotificationManager()
+        notifier: SystemNotificationManager = SystemNotificationManager(),
+        launchedByWiFiTrigger: Bool = CommandLine.arguments.contains(WiFiLaunchAgent.launchedByTriggerArgument)
     ) {
         self.settings = settings
         self.wifiMonitor = wifiMonitor
         self.notifier = notifier
         self.credentialState = ProfileCredentialStateMachine(initialSSID: wifiMonitor.currentSSID)
+        self.wifiLifecycle = WiFiOnlyLifecycleStateMachine(launchedByWiFiTrigger: launchedByWiFiTrigger)
         self.reconnectLogs = reconnectLogFile.recentEntries(limit: Self.reconnectLogLimit)
 
         wifiMonitor.onSSIDChanged = { [weak self] ssid in
@@ -168,14 +177,21 @@ final class RouterViewModel {
     }
 
     func startPolling() {
-        guard pollingTask == nil else { return }
+        guard pollingTask == nil, !wifiLifecycle.isSuspendedOutsideBoundWiFi else { return }
         pollingTask = Task { [weak self] in
             while let self, !Task.isCancelled {
-                if self.isCredentialReady && !self.credentialState.isSystemSleeping {
+                if self.isCredentialReady && !self.credentialState.isSystemSleeping && !self.wifiLifecycle.isSuspendedOutsideBoundWiFi {
                     await self.refreshNow(silent: true)
                 }
                 let baseInterval = self.isUIActive ? min(2.0, self.settings.pollingInterval) : max(10.0, self.settings.pollingInterval * 2.0)
-                let interval = self.isSessionOccupied ? max(15.0, baseInterval * 4.0) : baseInterval
+                let interval: Double
+                if self.isSessionOccupied {
+                    interval = max(15.0, baseInterval * 4.0)
+                } else if self.snapshot == nil && self.isCredentialReady && self.consecutiveInitialPollFailures < 3 {
+                    interval = 1.0
+                } else {
+                    interval = baseInterval
+                }
                 try? await Task.sleep(for: .seconds(interval), clock: .suspending)
             }
         }
@@ -187,19 +203,30 @@ final class RouterViewModel {
     }
 
     func setUIActive(_ active: Bool) {
-        isUIActive = active
-        if active {
+        setUIState(isVisible: active, isBlockingAutoQuit: active)
+    }
+
+    func setUIState(isVisible: Bool, isBlockingAutoQuit: Bool) {
+        isUIActive = isVisible
+        self.isBlockingAutoQuit = isBlockingAutoQuit
+        if wifiLifecycle.noteBlockingUIChanged(
+            isBlockingAutoQuit: isBlockingAutoQuit,
+            wifiOnlyLaunch: settings.wifiOnlyLaunch,
+            isBoundWiFiMatched: matchedProfileForCurrentWiFi != nil
+        ) {
+            terminateHandler()
+            return
+        }
+        syncUnboundSuspensionState()
+        if isVisible {
             wifiMonitor.refreshSSID(scheduleFollowUpIfNil: true)
-            if wifiMonitor.isInteractiveGUISession {
-                recoverSessionAndWatchdogAfterWakeOrPathReady(isInteractiveGUI: true, triggerRefresh: false)
-            }
-            if isCredentialReady && !isSessionOccupied {
-                Task { await refreshNow(silent: true) }
-            }
-        } else if leaveQuitDeferredByUI {
-            leaveQuitDeferredByUI = false
-            if settings.wifiOnlyLaunch && matchedProfileForCurrentWiFi == nil {
-                NSApp.terminate(nil)
+            if !wifiLifecycle.isSuspendedOutsideBoundWiFi {
+                if wifiMonitor.isInteractiveGUISession {
+                    recoverSessionAndWatchdogAfterWakeOrPathReady(isInteractiveGUI: true, triggerRefresh: false)
+                }
+                if isCredentialReady && !isSessionOccupied {
+                    Task { await refreshNow(silent: true) }
+                }
             }
         }
     }
@@ -207,6 +234,13 @@ final class RouterViewModel {
     // MARK: - Watchdog Controls
 
     func startWatchdog() {
+        guard !wifiLifecycle.isSuspendedOutsideBoundWiFi else {
+            if !userStoppedWatchdog {
+                watchdogPausedForUnboundWiFi = true
+                watchdogPhase = .paused(reason: "当前未连接已绑定 Wi-Fi")
+            }
+            return
+        }
         guard let client else {
             appendWatchdogLog(WatchdogLogEntry(level: .error, message: "尚未配置有效的路由器地址，无法启动守护"))
             return
@@ -304,6 +338,7 @@ final class RouterViewModel {
     func stopWatchdog(userInitiated: Bool = true) {
         if userInitiated {
             userStoppedWatchdog = true
+            watchdogPausedForUnboundWiFi = false
             credentialState.noteUserStoppedWatchdog()
         }
         let wasRunning = isWatchdogRunning
@@ -494,9 +529,9 @@ final class RouterViewModel {
             rebuildClient()
         }
 
-        guard isCredentialReady else { return }
+        guard isCredentialReady, !wifiLifecycle.isSuspendedOutsideBoundWiFi else { return }
         if triggerRefresh && !isSessionOccupied {
-            Task { await refreshNow(silent: true) }
+            abortStalledInitialPollOrRefresh(silent: true)
         }
         if credentialState.shouldResumeWatchdog(
             isCredentialReady: isCredentialReady,
@@ -525,7 +560,17 @@ final class RouterViewModel {
     }
 
     private func handleWiFiSSIDChanged(_ ssid: String?) {
-        evaluateLeaveQuit()
+        let wasSuspendedForUnbound = isActivitySuspendedForUnboundWiFi
+        evaluateLeaveQuit(syncResumeNow: false)
+        guard !wifiLifecycle.isSuspendedOutsideBoundWiFi else {
+            _ = credentialState.noteSSIDChanged(
+                ssid,
+                matchedProfileID: nil,
+                activeProfileID: settings.activeProfileID,
+                autoMatchEnabled: settings.autoMatchByWiFi
+            )
+            return
+        }
         let matched = RouterProfileMatcher.match(ssid: ssid, in: settings.profiles)
         let decision = credentialState.noteSSIDChanged(
             ssid,
@@ -536,30 +581,69 @@ final class RouterViewModel {
 
         if let targetID = decision.shouldSelectProfileID, let matched {
             selectProfile(targetID, announce: "已按 Wi-Fi「\(ssid ?? "")」自动切换配置：\(matched.name)")
-        } else if decision.shouldRefreshSameProfile {
-            let isGUI = wifiMonitor.isInteractiveGUISession
-            if isGUI {
-                preloadAllProfilePasswordsIfNeeded(isInteractiveGUI: true)
-            }
-            let wasReady = isCredentialReady
-            reloadPasswordFromKeychain(isInteractiveGUI: isGUI)
-            if isGUI {
-                scheduleDeferredCooldownRetryIfNeeded()
-            }
-            if !wasReady && isCredentialReady {
-                rebuildClient()
-            }
-            if isCredentialReady {
-                Task { await refreshNow(silent: true) }
-                if credentialState.shouldResumeWatchdog(
-                    isCredentialReady: isCredentialReady,
-                    isWatchdogRunning: isWatchdogRunning,
-                    autoStart: settings.watchdogConfig.autoStart,
-                    userStoppedWatchdog: userStoppedWatchdog
-                ) {
-                    startWatchdog()
+            syncUnboundSuspensionState(skipClientRebuild: true)
+        } else {
+            syncUnboundSuspensionState()
+            if decision.shouldRefreshSameProfile && !wasSuspendedForUnbound {
+                let isGUI = wifiMonitor.isInteractiveGUISession
+                if isGUI {
+                    preloadAllProfilePasswordsIfNeeded(isInteractiveGUI: true)
+                }
+                let wasReady = isCredentialReady
+                reloadPasswordFromKeychain(isInteractiveGUI: isGUI)
+                if isGUI {
+                    scheduleDeferredCooldownRetryIfNeeded()
+                }
+                if !wasReady && isCredentialReady {
+                    rebuildClient()
+                }
+                if isCredentialReady {
+                    abortStalledInitialPollOrRefresh(silent: true)
+                    if credentialState.shouldResumeWatchdog(
+                        isCredentialReady: isCredentialReady,
+                        isWatchdogRunning: isWatchdogRunning,
+                        autoStart: settings.watchdogConfig.autoStart,
+                        userStoppedWatchdog: userStoppedWatchdog
+                    ) {
+                        startWatchdog()
+                    }
                 }
             }
+        }
+    }
+
+    private func abortStalledInitialPollOrRefresh(silent: Bool) {
+        guard !wifiLifecycle.isSuspendedOutsideBoundWiFi else { return }
+        if snapshot == nil && isRefreshing && !isReconnectingWAN {
+            let age = currentRefreshStartedAt.map { $0.duration(to: ContinuousClock.now) } ?? .seconds(1)
+            if age >= .milliseconds(250) {
+                stalledInitialPollRetryTask?.cancel()
+                stalledInitialPollRetryTask = nil
+                stopPolling()
+                rebuildClient()
+                startPolling()
+                return
+            }
+            if stalledInitialPollRetryTask == nil {
+                stalledInitialPollRetryTask = Task { [weak self] in
+                    try? await Task.sleep(for: .milliseconds(300), clock: .suspending)
+                    guard !Task.isCancelled, let self else { return }
+                    self.stalledInitialPollRetryTask = nil
+                    guard !self.wifiLifecycle.isSuspendedOutsideBoundWiFi,
+                          self.snapshot == nil,
+                          self.isRefreshing,
+                          !self.isReconnectingWAN else { return }
+                    self.stopPolling()
+                    self.rebuildClient()
+                    self.startPolling()
+                }
+            }
+            return
+        }
+        if pollingTask == nil {
+            startPolling()
+        } else {
+            Task { await refreshNow(silent: silent) }
         }
     }
 
@@ -577,7 +661,8 @@ final class RouterViewModel {
 
     func selectProfile(_ profileID: UUID, announce: String? = nil) {
         guard settings.profiles.contains(where: { $0.id == profileID }) else { return }
-        let wasWatchdogRunning = isWatchdogRunning
+        let wasWatchdogRunning = isWatchdogRunning || watchdogPausedForUnboundWiFi
+        watchdogPausedForUnboundWiFi = false
         credentialState.noteProfileSelected()
         settings.activeProfileID = profileID
         snapshot = nil
@@ -754,6 +839,7 @@ final class RouterViewModel {
         let wasActive = (settings.activeProfileID == id)
         credentialState.purgeProfile(id: id)
         settings.deleteProfile(id: id)
+        evaluateLeaveQuit()
         if wasActive {
             selectProfile(settings.activeProfileID)
         }
@@ -765,6 +851,7 @@ final class RouterViewModel {
         activateAndTest: Bool
     ) async {
         settings.updateProfile(profile)
+        evaluateLeaveQuit()
 
         if let password {
             let trimmedPass = password.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -854,12 +941,15 @@ final class RouterViewModel {
             target.wifiSSIDs.append(ssid)
             settings.updateProfile(target)
         }
+        evaluateLeaveQuit()
         showToast("已将 Wi-Fi「\(ssid)」绑定到「\(target.name)」")
     }
 
     func rebuildClient() {
         clientGeneration += 1
         isRefreshing = false
+        currentRefreshStartedAt = nil
+        consecutiveInitialPollFailures = 0
         lastStationFetchAt = nil
         let profile = activeProfile
         do {
@@ -907,9 +997,11 @@ final class RouterViewModel {
         }
 
         isRefreshing = true
+        currentRefreshStartedAt = ContinuousClock.now
         defer {
             if clientGeneration == gen {
                 isRefreshing = false
+                currentRefreshStartedAt = nil
             }
         }
 
@@ -933,11 +1025,15 @@ final class RouterViewModel {
                 fresh.lanStations = previous.lanStations
             }
             self.snapshot = fresh
+            self.consecutiveInitialPollFailures = 0
             self.recordSignalSample(from: fresh)
             self.lastError = nil
             self.isSessionOccupied = false
         } catch let routerError as ZTERouterError {
             guard clientGeneration == gen else { return }
+            if self.snapshot == nil {
+                self.consecutiveInitialPollFailures += 1
+            }
             credentialState.noteRouterInteractionResult(error: routerError)
             switch routerError {
             case .duplicateUser:
@@ -953,6 +1049,9 @@ final class RouterViewModel {
             }
         } catch {
             guard clientGeneration == gen else { return }
+            if self.snapshot == nil {
+                self.consecutiveInitialPollFailures += 1
+            }
             if !silent || self.snapshot == nil {
                 self.lastError = error.localizedDescription
             }
@@ -1116,34 +1215,131 @@ final class RouterViewModel {
 
     /// Called by the explicit Quit actions: on a bound Wi-Fi the launch trigger must not bring the app back.
     func noteUserQuit() {
-        guard settings.wifiOnlyLaunch, let ssid = wifiMonitor.currentSSID, matchedProfileForCurrentWiFi != nil else { return }
+        guard settings.wifiOnlyLaunch else { return }
+        let priorSSID = wifiMonitor.currentSSID
+        wifiMonitor.refreshSSID()
+        let effectiveSSID = wifiMonitor.currentSSID ?? (wifiMonitor.isWiFiPoweredOn ? priorSSID : nil)
+        guard let ssid = effectiveSSID,
+              RouterProfileMatcher.match(ssid: ssid, in: settings.profiles) != nil else {
+            return
+        }
         WiFiLaunchAgent.suppressLaunch(onSSID: ssid)
     }
 
-    /// In Wi-Fi-only mode, quits 60s after leaving a bound Wi-Fi. A run that never saw a bound Wi-Fi
-    /// (the user opened the app elsewhere on purpose) is left alone.
-    private func evaluateLeaveQuit() {
-        guard settings.wifiOnlyLaunch, matchedProfileForCurrentWiFi == nil else {
-            if matchedProfileForCurrentWiFi != nil {
-                sawBoundWiFi = true
-            }
+    /// In Wi-Fi-only mode, immediately suspends polling and watchdog upon leaving a bound Wi-Fi, then
+    /// quits after 1.5s on a definite unbound network / Wi-Fi off (or 8s grace while roaming with nil SSID).
+    private func evaluateLeaveQuit(syncResumeNow: Bool = true) {
+        let evaluation = wifiLifecycle.evaluate(
+            wifiOnlyLaunch: settings.wifiOnlyLaunch,
+            currentSSID: wifiMonitor.currentSSID,
+            isWiFiPoweredOn: wifiMonitor.isWiFiPoweredOn,
+            isBoundWiFiMatched: matchedProfileForCurrentWiFi != nil
+        )
+
+        if evaluation.isSuspendedOutsideBoundWiFi || syncResumeNow {
+            syncUnboundSuspensionState()
+        }
+
+        switch evaluation.timerAction {
+        case .none:
+            break
+        case .cancelTimer:
+            leaveQuitGeneration += 1
             leaveQuitTask?.cancel()
             leaveQuitTask = nil
-            leaveQuitDeferredByUI = false
-            return
+        case let .startTimer(tier):
+            leaveQuitGeneration += 1
+            let gen = leaveQuitGeneration
+            leaveQuitTask?.cancel()
+            leaveQuitTask = Task { [weak self] in
+                // Suspending clock: time asleep does not count, so waking up does not quit before Wi-Fi rejoins.
+                try? await Task.sleep(for: tier.delay, clock: .suspending)
+                guard !Task.isCancelled, let self, self.leaveQuitGeneration == gen else { return }
+                self.leaveQuitTask = nil
+                self.wifiMonitor.refreshSSID()
+                guard self.leaveQuitGeneration == gen else { return }
+                if self.wifiLifecycle.timerDidFire(
+                    wifiOnlyLaunch: self.settings.wifiOnlyLaunch,
+                    isBoundWiFiMatched: self.matchedProfileForCurrentWiFi != nil,
+                    isBlockingAutoQuit: self.isBlockingAutoQuit
+                ) {
+                    self.terminateHandler()
+                } else {
+                    self.syncUnboundSuspensionState()
+                }
+            }
         }
-        guard sawBoundWiFi, leaveQuitTask == nil else { return }
-        leaveQuitTask = Task { [weak self] in
-            // Suspending clock: time asleep does not count, so waking up does not quit before Wi-Fi rejoins.
-            try? await Task.sleep(for: .seconds(60), clock: .suspending)
-            guard !Task.isCancelled, let self else { return }
-            self.leaveQuitTask = nil
-            self.wifiMonitor.refreshSSID()
-            guard self.settings.wifiOnlyLaunch, self.matchedProfileForCurrentWiFi == nil else { return }
-            if self.isUIActive {
-                self.leaveQuitDeferredByUI = true
-            } else {
-                NSApp.terminate(nil)
+    }
+
+    private func syncUnboundSuspensionState(skipClientRebuild: Bool = false) {
+        if wifiLifecycle.isSuspendedOutsideBoundWiFi {
+            guard !isActivitySuspendedForUnboundWiFi else { return }
+            isActivitySuspendedForUnboundWiFi = true
+            suspendActivityForUnboundWiFi()
+        } else if isActivitySuspendedForUnboundWiFi {
+            isActivitySuspendedForUnboundWiFi = false
+            resumeActivityAfterBoundWiFiRestored(skipClientRebuild: skipClientRebuild)
+        }
+    }
+
+    private func suspendActivityForUnboundWiFi() {
+        stalledInitialPollRetryTask?.cancel()
+        stalledInitialPollRetryTask = nil
+        stopPolling()
+        rebuildClient()
+        let shouldRememberWatchdog = isWatchdogRunning || credentialState.shouldResumeWatchdog(
+            isCredentialReady: isCredentialReady,
+            isWatchdogRunning: isWatchdogRunning,
+            autoStart: settings.watchdogConfig.autoStart,
+            userStoppedWatchdog: userStoppedWatchdog
+        )
+        if shouldRememberWatchdog && !userStoppedWatchdog {
+            watchdogPausedForUnboundWiFi = true
+        }
+        if isWatchdogRunning {
+            stopWatchdog(userInitiated: false)
+        }
+        if watchdogPausedForUnboundWiFi {
+            watchdogPhase = .paused(reason: "当前未连接已绑定 Wi-Fi")
+        }
+    }
+
+    private func resumeActivityAfterBoundWiFiRestored(skipClientRebuild: Bool = false) {
+        let isGUI = wifiMonitor.isInteractiveGUISession
+        if !isCredentialReady {
+            if isGUI {
+                preloadAllProfilePasswordsIfNeeded(isInteractiveGUI: true)
+            }
+            reloadPasswordFromKeychain(isInteractiveGUI: isGUI)
+            if isGUI {
+                scheduleDeferredCooldownRetryIfNeeded()
+            }
+        }
+        if !skipClientRebuild {
+            rebuildClient()
+        }
+        startPolling()
+        let shouldStartWatchdog = watchdogPausedForUnboundWiFi || credentialState.shouldResumeWatchdog(
+            isCredentialReady: isCredentialReady,
+            isWatchdogRunning: isWatchdogRunning,
+            autoStart: settings.watchdogConfig.autoStart,
+            userStoppedWatchdog: userStoppedWatchdog
+        )
+        watchdogPausedForUnboundWiFi = false
+        if shouldStartWatchdog && isCredentialReady && !userStoppedWatchdog {
+            if !isWatchdogRunning {
+                startWatchdog()
+            }
+        } else {
+            if activeCredentialIssue?.isSystemDeferred == true && shouldStartWatchdog {
+                credentialState.noteWatchdogPausedForDeferredCredential(
+                    wasRunning: true,
+                    autoStart: settings.watchdogConfig.autoStart,
+                    userStoppedWatchdog: userStoppedWatchdog
+                )
+            }
+            if !isWatchdogRunning {
+                watchdogPhase = .idle
             }
         }
     }

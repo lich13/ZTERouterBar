@@ -39,7 +39,7 @@ enum SettingsKeys {
 final class SettingsStore {
     private typealias Keys = SettingsKeys
 
-    private static let currentWatchdogDefaultsVersion = 6
+    private static let currentWatchdogDefaultsVersion = 7
 
     var profiles: [RouterProfile] {
         didSet { saveProfiles() }

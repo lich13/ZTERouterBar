@@ -17,6 +17,10 @@ public final class URLSessionTransport: HTTPTransport, @unchecked Sendable {
         self.session = URLSession(configuration: config)
     }
 
+    deinit {
+        session.invalidateAndCancel()
+    }
+
     public func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {

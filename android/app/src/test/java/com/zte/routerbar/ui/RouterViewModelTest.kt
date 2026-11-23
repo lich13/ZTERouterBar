@@ -2,6 +2,8 @@ package com.zte.routerbar.ui
 
 import android.net.Network
 import com.zte.routerbar.core.AuthHashPreference
+import com.zte.routerbar.core.EndpointProbeOutcome
+import com.zte.routerbar.core.ProbeEndpoint
 import com.zte.routerbar.core.RouterEndpointConfig
 import com.zte.routerbar.core.RouterHttpRequest
 import com.zte.routerbar.core.RouterHttpResponse
@@ -223,6 +225,86 @@ class RouterViewModelTest {
         assertEquals("p1", vm.uiState.value.editingProfileId)
         assertEquals("热点 1", vm.uiState.value.draftName)
     }
+
+    @Test
+    fun manualProbeRunsAllFourPresetsConcurrentlyStreamsPartialResultsAndGuardsReentrancy() = runTest {
+        val p1 = RouterProfile(id = "p1", name = "默认路由器", routerUrlString = "http://192.168.8.1")
+        val profileRepo = FakeProfileRepo(StoredAppSettings(profiles = listOf(p1), activeProfileId = "p1"))
+        val credRepo = FakeCredentialRepo(mutableMapOf()) // Works even without router password configured!
+        val wifi = FakeWifiMonitor(WifiLanState(isWifiConnected = true, gatewayIpv4 = "192.168.8.1"))
+
+        var totalProbeCalls = 0
+        var expectedRefreshCount = 1
+        val vm = RouterViewModel(
+            profileRepo = profileRepo,
+            credentialRepo = credRepo,
+            wifiMonitor = wifi,
+            endpointProber = { endpoint ->
+                assertEquals(expectedRefreshCount, wifi.refreshCount)
+                totalProbeCalls += 1
+                when (endpoint.id) {
+                    "661313-204" -> {
+                        delay(80L)
+                        EndpointProbeOutcome(endpoint.id, endpoint.name, endpoint.urlString, reachable = true, statusCode = 204, elapsedMs = 80)
+                    }
+                    "youtube-204" -> {
+                        delay(120L)
+                        EndpointProbeOutcome(endpoint.id, endpoint.name, endpoint.urlString, reachable = true, statusCode = 204, elapsedMs = 120)
+                    }
+                    "cloudflare-doh" -> {
+                        delay(150L)
+                        EndpointProbeOutcome(endpoint.id, endpoint.name, endpoint.urlString, reachable = true, statusCode = 200, elapsedMs = 150)
+                    }
+                    else -> {
+                        delay(2_000L)
+                        EndpointProbeOutcome(endpoint.id, endpoint.name, endpoint.urlString, reachable = false, elapsedMs = 2_000, errorMessage = "请求超时 (10s)")
+                    }
+                }
+            },
+            clockMs = { testScheduler.currentTime },
+            delayFn = { delay(it) },
+            externalScope = backgroundScope
+        )
+        runCurrent()
+        assertEquals(4, vm.uiState.value.probeEndpoints.size)
+        assertFalse(vm.uiState.value.hasStoredPassword)
+
+        vm.triggerManualProbe()
+        // Duplicate click while probing must be ignored
+        vm.triggerManualProbe()
+        runCurrent()
+        assertTrue(vm.uiState.value.isProbingNodes)
+
+        // At 200ms, the 3 fast nodes have already streamed into probeOutcomes while the 4th is still running
+        advanceTimeBy(200L)
+        runCurrent()
+        assertTrue(vm.uiState.value.isProbingNodes)
+        assertEquals(3, vm.uiState.value.probeOutcomes.size)
+        assertEquals(true, vm.uiState.value.probeOutcomes["661313-204"]?.reachable)
+        assertEquals(200, vm.uiState.value.probeOutcomes["cloudflare-doh"]?.statusCode)
+
+        // At 2_000ms total (not 80+120+150+2000 serial!), the entire concurrent round finishes
+        advanceTimeBy(1_850L)
+        runCurrent()
+        assertFalse(vm.uiState.value.isProbingNodes)
+        assertEquals(4, totalProbeCalls)
+        assertEquals(4, vm.uiState.value.probeOutcomes.size)
+        assertEquals(false, vm.uiState.value.probeOutcomes["telegram-api"]?.reachable)
+        assertEquals(2_050L, testScheduler.currentTime)
+        assertEquals(2_000L, vm.uiState.value.lastProbeCompletedAtMs)
+
+        // Subsequent manual trigger refreshes wifiMonitor again and clears stale outcomes cleanly
+        expectedRefreshCount = 2
+        vm.triggerManualProbe()
+        runCurrent()
+        assertTrue(vm.uiState.value.isProbingNodes)
+        assertTrue(vm.uiState.value.probeOutcomes.isEmpty())
+        advanceTimeBy(2_050L)
+        runCurrent()
+        assertFalse(vm.uiState.value.isProbingNodes)
+        assertEquals(8, totalProbeCalls)
+        assertEquals(2, wifi.refreshCount)
+    }
 }
 
 private class FakeProfileRepo(initial: StoredAppSettings) : ProfileRepository {
@@ -247,8 +329,11 @@ private class FakeCredentialRepo(private val map: MutableMap<String, String>) : 
 private class FakeWifiMonitor(initial: WifiLanState) : WifiLanMonitor {
     private val _state = MutableStateFlow(initial)
     override val state: StateFlow<WifiLanState> = _state
+    var refreshCount: Int = 0
     override fun currentWifiNetwork(): Network? = null
-    override fun refresh() = Unit
+    override fun refresh() {
+        refreshCount += 1
+    }
     override fun close() = Unit
     fun emit(next: WifiLanState) {
         _state.value = next

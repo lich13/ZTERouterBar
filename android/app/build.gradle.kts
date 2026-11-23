@@ -17,7 +17,7 @@ fun computeVersionCode(rawVersion: String): Int {
 
 val appVersion: String = providers.gradleProperty("appVersion")
     .orElse(providers.environmentVariable("APP_VERSION"))
-    .orElse("1.3.2")
+    .orElse("1.3.3")
     .get()
     .removePrefix("v")
 

@@ -118,4 +118,35 @@ object AppIcons {
             }
         }.build()
     }
+
+    val SpeedProbe: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "SpeedProbe",
+            defaultWidth = 18.dp,
+            defaultHeight = 18.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f
+        ).apply {
+            path(
+                stroke = SolidColor(Color.Black),
+                strokeLineWidth = 2f,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round
+            ) {
+                moveTo(5.2f, 17.8f)
+                curveTo(3.8f, 16.2f, 3f, 14.2f, 3f, 12f)
+                curveTo(3f, 7.03f, 7.03f, 3f, 12f, 3f)
+                reflectiveCurveTo(21f, 7.03f, 21f, 12f)
+                curveTo(21f, 14.2f, 20.2f, 16.2f, 18.8f, 17.8f)
+                moveTo(12f, 13f)
+                lineTo(16.2f, 8.8f)
+                moveTo(10.8f, 13f)
+                curveTo(10.8f, 12.34f, 11.34f, 11.8f, 12f, 11.8f)
+                reflectiveCurveTo(13.2f, 12.34f, 13.2f, 13f)
+                reflectiveCurveTo(12.66f, 14.2f, 12f, 14.2f)
+                reflectiveCurveTo(10.8f, 13.66f, 10.8f, 13f)
+                close()
+            }
+        }.build()
+    }
 }

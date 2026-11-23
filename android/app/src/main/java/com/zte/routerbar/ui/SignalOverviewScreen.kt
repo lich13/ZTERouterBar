@@ -27,6 +27,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -60,6 +61,8 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.zte.routerbar.core.EndpointProbeOutcome
+import com.zte.routerbar.core.ProbeEndpoint
 import com.zte.routerbar.core.SignalEvaluator
 import com.zte.routerbar.core.WANConnectionState
 
@@ -162,6 +165,20 @@ fun SignalOverviewScreen(viewModel: RouterViewModel) {
 
             if (!uiState.hasStoredPassword) {
                 InlineQuickSetupCard(uiState = uiState, viewModel = viewModel)
+
+                uiState.lastError?.let { errorMsg ->
+                    ErrorAndTakeoverCard(
+                        error = errorMsg,
+                        isSessionOccupied = false,
+                        onTakeover = {}
+                    )
+                }
+
+                NodeLatencyProbeCard(
+                    uiState = uiState,
+                    screenWidthDp = screenWidthDp,
+                    onTriggerProbe = viewModel::triggerManualProbe
+                )
             } else {
                 WanReconnectHeroCard(uiState = uiState, viewModel = viewModel)
 
@@ -179,6 +196,12 @@ fun SignalOverviewScreen(viewModel: RouterViewModel) {
                         onTakeover = viewModel::triggerManualRefresh
                     )
                 }
+
+                NodeLatencyProbeCard(
+                    uiState = uiState,
+                    screenWidthDp = screenWidthDp,
+                    onTriggerProbe = viewModel::triggerManualProbe
+                )
 
                 val snap = uiState.snapshot
                 if (snap != null) {
@@ -223,14 +246,6 @@ fun SignalOverviewScreen(viewModel: RouterViewModel) {
                         }
                     }
                 }
-            }
-
-            if (!uiState.hasStoredPassword && uiState.lastError != null) {
-                ErrorAndTakeoverCard(
-                    error = uiState.lastError!!,
-                    isSessionOccupied = false,
-                    onTakeover = {}
-                )
             }
         }
     }
@@ -647,6 +662,253 @@ private fun ErrorAndTakeoverCard(
                         Text("尝试接管并重连")
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NodeLatencyProbeCard(
+    uiState: RouterUiState,
+    screenWidthDp: Int,
+    onTriggerProbe: () -> Unit
+) {
+    val endpoints = uiState.probeEndpoints
+    if (endpoints.isEmpty()) return
+
+    val total = endpoints.size
+    val completedCount = endpoints.count { uiState.probeOutcomes.containsKey(it.id) }
+    val reachableCount = endpoints.count { uiState.probeOutcomes[it.id]?.reachable == true }
+    val summaryTone = when {
+        reachableCount == total && completedCount == total -> MetricTone.EXCELLENT
+        reachableCount * 2 > total -> MetricTone.GOOD
+        reachableCount > 0 -> MetricTone.FAIR
+        else -> MetricTone.POOR
+    }
+
+    ElevatedCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = "外网节点测速",
+                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                        if (uiState.isProbingNodes || completedCount > 0) {
+                            val badgeColor = if (uiState.isProbingNodes) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                toneColor(summaryTone)
+                            }
+                            val summaryText = if (uiState.isProbingNodes) {
+                                "检测 $completedCount/$total"
+                            } else {
+                                "可达 $reachableCount/$total"
+                            }
+                            Surface(
+                                shape = CircleShape,
+                                color = badgeColor.copy(alpha = 0.14f)
+                            ) {
+                                Text(
+                                    text = summaryText,
+                                    style = MaterialTheme.typography.labelSmall.tabularNums().copy(fontWeight = FontWeight.SemiBold),
+                                    color = badgeColor,
+                                    maxLines = 1,
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    val subtitle = when {
+                        uiState.isProbingNodes -> "并发检测 $total 个默认节点（超时 ${ProbeEndpoint.DEFAULT_TIMEOUT_SEC}s）…"
+                        uiState.lastProbeCompletedAtMs != null -> "上次测速 ${Formatters.timeOfDay(uiState.lastProbeCompletedAtMs)}"
+                        else -> "并发检测连通性与 HTTP 响应延迟"
+                    }
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.labelSmall.tabularNums(),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                FilledTonalButton(
+                    onClick = onTriggerProbe,
+                    enabled = !uiState.isProbingNodes,
+                    modifier = Modifier.heightIn(min = 44.dp)
+                ) {
+                    if (uiState.isProbingNodes) {
+                        CircularProgressIndicator(
+                            strokeWidth = 2.dp,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("测速中…")
+                    } else {
+                        Icon(
+                            imageVector = AppIcons.SpeedProbe,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text(
+                            text = if (completedCount == 0) "立即测速" else "重新测速",
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+
+            val cols = LayoutSpec.probeGridColumns(screenWidthDp)
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                endpoints.chunked(cols).forEach { rowItems ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        rowItems.forEach { endpoint ->
+                            ProbeEndpointItem(
+                                endpoint = endpoint,
+                                outcome = uiState.probeOutcomes[endpoint.id],
+                                isProbingNodes = uiState.isProbingNodes,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        repeat(cols - rowItems.size) {
+                            Spacer(modifier = Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProbeEndpointItem(
+    endpoint: ProbeEndpoint,
+    outcome: EndpointProbeOutcome?,
+    isProbingNodes: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val dotColor: Color = when {
+        outcome != null && outcome.reachable -> toneColor(MetricTone.EXCELLENT)
+        outcome != null -> toneColor(MetricTone.POOR)
+        isProbingNodes -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.outline
+    }
+
+    val badgeText: String
+    val badgeTextColor: Color
+    val badgeContainerColor: Color
+    when {
+        outcome == null && isProbingNodes -> {
+            badgeText = "测速中…"
+            badgeTextColor = MaterialTheme.colorScheme.primary
+            badgeContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+        }
+        outcome == null -> {
+            badgeText = "待测速"
+            badgeTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+            badgeContainerColor = MaterialTheme.colorScheme.surfaceVariant
+        }
+        outcome.reachable -> {
+            val codeText = outcome.statusCode?.toString() ?: "OK"
+            badgeText = "$codeText · ${outcome.elapsedMs}ms"
+            val okColor = toneColor(MetricTone.EXCELLENT)
+            badgeTextColor = okColor
+            badgeContainerColor = okColor.copy(alpha = 0.14f)
+        }
+        else -> {
+            badgeText = when {
+                outcome.errorMessage?.contains("超时") == true -> "超时 (${endpoint.timeoutSec}s)"
+                outcome.statusCode != null -> "HTTP ${outcome.statusCode}"
+                else -> "不可达"
+            }
+            val failColor = toneColor(MetricTone.POOR)
+            badgeTextColor = failColor
+            badgeContainerColor = failColor.copy(alpha = 0.14f)
+        }
+    }
+
+    val errorDetail = outcome?.takeIf { !it.reachable }?.errorMessage
+        ?.takeIf { it.isNotBlank() && !it.startsWith("请求超时") }
+
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(7.dp)
+                    .clip(CircleShape)
+                    .background(dotColor)
+            )
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(1.dp)
+            ) {
+                Text(
+                    text = endpoint.displayTitle,
+                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (errorDetail != null) {
+                    Text(
+                        text = errorDetail,
+                        style = MaterialTheme.typography.labelSmall.tabularNums(),
+                        color = toneColor(MetricTone.POOR),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            Surface(
+                shape = CircleShape,
+                color = badgeContainerColor
+            ) {
+                Text(
+                    text = badgeText,
+                    style = MaterialTheme.typography.labelSmall.tabularNums().copy(fontWeight = FontWeight.SemiBold),
+                    color = badgeTextColor,
+                    maxLines = 1,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                )
             }
         }
     }

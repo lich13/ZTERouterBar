@@ -22,8 +22,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func quitByUser() {
-        viewModel.noteUserQuit()
-        NSApp.terminate(nil)
+        if let statusBarController {
+            statusBarController.quitByUser()
+        } else {
+            viewModel.noteUserQuit()
+            NSApp.terminate(nil)
+        }
     }
 
     private func setupMainMenu() {

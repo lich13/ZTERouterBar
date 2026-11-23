@@ -4,12 +4,14 @@ import CoreLocation
 import CoreWLAN
 import Foundation
 import Network
+import notify
 import ZTERouterCore
 
 @MainActor
 @Observable
 final class WiFiNetworkMonitor: NSObject, CLLocationManagerDelegate, CWEventDelegate {
     var currentSSID: String?
+    var isWiFiPoweredOn: Bool
     var authorizationStatus: CLAuthorizationStatus
     var isWiFiPathSatisfied: Bool = false
 
@@ -17,6 +19,7 @@ final class WiFiNetworkMonitor: NSObject, CLLocationManagerDelegate, CWEventDele
     private let wifiClient = CWWiFiClient.shared()
     private let pathMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
     private let monitorQueue = DispatchQueue(label: "com.zte.routerbar.wifiMonitor")
+    @ObservationIgnored nonisolated(unsafe) private var networkChangeNotifyToken: Int32 = -1
 
     private var screensKnownAsleep = false
     private var ssidRetryTask: Task<Void, Never>?
@@ -38,12 +41,15 @@ final class WiFiNetworkMonitor: NSObject, CLLocationManagerDelegate, CWEventDele
 
     override init() {
         self.authorizationStatus = locationManager.authorizationStatus
+        self.isWiFiPoweredOn = wifiClient.interface()?.powerOn() ?? false
         super.init()
         locationManager.delegate = self
         wifiClient.delegate = self
 
         try? wifiClient.startMonitoringEvent(with: .ssidDidChange)
         try? wifiClient.startMonitoringEvent(with: .linkDidChange)
+        try? wifiClient.startMonitoringEvent(with: .bssidDidChange)
+        try? wifiClient.startMonitoringEvent(with: .powerDidChange)
 
         pathMonitor.pathUpdateHandler = { [weak self] path in
             let satisfied = (path.status == .satisfied)
@@ -58,8 +64,34 @@ final class WiFiNetworkMonitor: NSObject, CLLocationManagerDelegate, CWEventDele
             }
         }
         pathMonitor.start(queue: monitorQueue)
+
+        var token: Int32 = -1
+        let registerStatus = notify_register_dispatch(
+            "com.apple.system.config.network_change",
+            &token,
+            monitorQueue
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.refreshSSID(scheduleFollowUpIfNil: true)
+                if self.isWiFiPathSatisfied || self.isWiFiPoweredOn {
+                    self.onWiFiPathReady?()
+                }
+            }
+        }
+        if registerStatus == NOTIFY_STATUS_OK {
+            self.networkChangeNotifyToken = token
+        }
+
         registerSessionAndPowerObservers()
         refreshSSID(scheduleFollowUpIfNil: true)
+    }
+
+    deinit {
+        if networkChangeNotifyToken != -1 {
+            notify_cancel(networkChangeNotifyToken)
+        }
+        pathMonitor.cancel()
     }
 
     func requestLocationPermission() {
@@ -76,28 +108,33 @@ final class WiFiNetworkMonitor: NSObject, CLLocationManagerDelegate, CWEventDele
 
     func refreshSSID(scheduleFollowUpIfNil: Bool = false) {
         authorizationStatus = locationManager.authorizationStatus
-        let detected = wifiClient.interface()?.ssid()?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let iface = wifiClient.interface()
+        let poweredOn = iface?.powerOn() ?? false
+        let detected = poweredOn ? iface?.ssid()?.trimmingCharacters(in: .whitespacesAndNewlines) : nil
         let normalized = (detected?.isEmpty == false) ? detected : nil
 
-        if normalized != nil {
+        if normalized != nil || !poweredOn {
             ssidRetryTask?.cancel()
             ssidRetryTask = nil
         } else if scheduleFollowUpIfNil && isLocationAuthorized && ssidRetryTask == nil {
             ssidRetryTask = Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(500), clock: .suspending)
-                guard !Task.isCancelled, let self else { return }
-                self.refreshSSID(scheduleFollowUpIfNil: false)
-                if self.currentSSID == nil {
-                    try? await Task.sleep(for: .milliseconds(1500), clock: .suspending)
-                    guard !Task.isCancelled else { return }
+                for _ in 0..<12 {
+                    try? await Task.sleep(for: .milliseconds(400), clock: .suspending)
+                    guard !Task.isCancelled, let self else { return }
                     self.refreshSSID(scheduleFollowUpIfNil: false)
+                    if self.currentSSID != nil || !self.isWiFiPoweredOn {
+                        break
+                    }
                 }
-                self.ssidRetryTask = nil
+                self?.ssidRetryTask = nil
             }
         }
 
-        if currentSSID != normalized {
-            currentSSID = normalized
+        let ssidChanged = (currentSSID != normalized)
+        let powerChanged = (isWiFiPoweredOn != poweredOn)
+        isWiFiPoweredOn = poweredOn
+        currentSSID = normalized
+        if ssidChanged || powerChanged {
             onSSIDChanged?(normalized)
         }
     }
@@ -117,6 +154,24 @@ final class WiFiNetworkMonitor: NSObject, CLLocationManagerDelegate, CWEventDele
     }
 
     nonisolated func linkDidChangeForWiFiInterface(withName interfaceName: String) {
+        Task { @MainActor [weak self] in
+            self?.refreshSSID(scheduleFollowUpIfNil: true)
+        }
+    }
+
+    nonisolated func bssidDidChangeForWiFiInterface(withName interfaceName: String) {
+        Task { @MainActor [weak self] in
+            self?.refreshSSID(scheduleFollowUpIfNil: true)
+        }
+    }
+
+    nonisolated func powerStateDidChangeForWiFiInterface(withName interfaceName: String) {
+        Task { @MainActor [weak self] in
+            self?.refreshSSID(scheduleFollowUpIfNil: true)
+        }
+    }
+
+    nonisolated func clientConnectionInterrupted() {
         Task { @MainActor [weak self] in
             self?.refreshSSID(scheduleFollowUpIfNil: true)
         }

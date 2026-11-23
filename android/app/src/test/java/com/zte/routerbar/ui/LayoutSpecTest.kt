@@ -17,6 +17,8 @@ class LayoutSpecTest {
         assertEquals(2, LayoutSpec.cellGridColumns(600))
         assertEquals(1, LayoutSpec.detailPairsPerRow(390))
         assertEquals(2, LayoutSpec.detailPairsPerRow(700))
+        assertEquals(1, LayoutSpec.probeGridColumns(412))
+        assertEquals(2, LayoutSpec.probeGridColumns(600))
     }
 
     @Test

@@ -27,7 +27,7 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
 
     public static let defaultWeight = 1
     public static let defaultIntervalSec = 33
-    public static let defaultTimeoutSec = 4
+    public static let defaultTimeoutSec = 10
 
     public static let weightRange = 1...10
     public static let intervalRange = 5...3600
@@ -124,7 +124,7 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
                 urlString: "https://661313.xyz/test/generate_204",
                 weight: 1,
                 intervalSec: 15,
-                timeoutSec: 3
+                timeoutSec: WatchdogEndpoint.defaultTimeoutSec
             ),
             WatchdogEndpoint(
                 isEnabled: true,
@@ -132,7 +132,7 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
                 urlString: "https://www.youtube.com/generate_204",
                 weight: 1,
                 intervalSec: 33,
-                timeoutSec: 4
+                timeoutSec: WatchdogEndpoint.defaultTimeoutSec
             ),
             WatchdogEndpoint(
                 isEnabled: true,
@@ -140,7 +140,7 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
                 urlString: "https://cloudflare-dns.com/cdn-cgi/trace",
                 weight: 1,
                 intervalSec: 33,
-                timeoutSec: 4
+                timeoutSec: WatchdogEndpoint.defaultTimeoutSec
             ),
             telegramPreset
         ]
@@ -154,7 +154,7 @@ public struct WatchdogEndpoint: Codable, Equatable, Identifiable, Sendable {
             urlString: "https://api.telegram.org/",
             weight: 1,
             intervalSec: 33,
-            timeoutSec: 4
+            timeoutSec: WatchdogEndpoint.defaultTimeoutSec
         )
     }
 }
@@ -175,9 +175,9 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
     public var onlyWhenWiFiMatched: Bool
     public var endpoints: [WatchdogEndpoint]
 
-    public static let defaultFailureWindowSec = 60
+    public static let defaultFailureWindowSec = 15
     public static let defaultRecheckIntervalSec = 5
-    public static let defaultPostReconnectGraceSec = 300
+    public static let defaultPostReconnectGraceSec = 180
     public static let defaultMaxConsecutiveReconnects = 3
     public static let defaultCooldownSec = 300
 
@@ -261,9 +261,9 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
     /// One-time migration of persisted configs. Versions below 4 predate per-endpoint seconds and
     /// `/test/generate_204`; versions below 5 predate the sustained-failure window and still carry
     /// the old hair-trigger defaults (661313 weight 3, 3s recheck, 60s cooldown); versions below 6
-    /// predate the 60s window / 300s grace defaults and the Telegram preset.
+    /// predate the Telegram preset; versions below 7 predate the 15s window / 180s grace / 10s timeout defaults.
     public func migratingLegacyDefaults(fromVersion version: Int) -> WatchdogConfig {
-        guard version < 6 else { return clamped() }
+        guard version < 7 else { return clamped() }
         var copy = self
         if version < 4 {
             let currentURLs = copy.endpoints.map(\.urlString)
@@ -277,7 +277,7 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
                     copy.endpoints[legacyIdx].name = "661313 204"
                     copy.endpoints[legacyIdx].urlString = "https://661313.xyz/test/generate_204"
                     copy.endpoints[legacyIdx].intervalSec = 15
-                    copy.endpoints[legacyIdx].timeoutSec = 3
+                    copy.endpoints[legacyIdx].timeoutSec = WatchdogEndpoint.defaultTimeoutSec
                 } else if !copy.endpoints.contains(where: { $0.urlString.contains("661313.xyz/test") }) {
                     copy.endpoints.insert(WatchdogEndpoint.defaultPresets[0], at: 0)
                 }
@@ -298,15 +298,23 @@ public struct WatchdogConfig: Codable, Equatable, Sendable {
                 copy.cooldownSec = WatchdogConfig.defaultCooldownSec
             }
         }
-        if copy.failureWindowSec == 30 {
+        if version < 6 {
+            let presets = WatchdogEndpoint.defaultPresets
+            if copy.endpoints.map(\.urlString) == presets.dropLast().map(\.urlString) {
+                copy.endpoints.append(WatchdogEndpoint.telegramPreset)
+            }
+        }
+        if copy.failureWindowSec == 30 || copy.failureWindowSec == 60 {
             copy.failureWindowSec = WatchdogConfig.defaultFailureWindowSec
         }
-        if copy.postReconnectGraceSec == 45 {
+        if copy.postReconnectGraceSec == 45 || copy.postReconnectGraceSec == 300 {
             copy.postReconnectGraceSec = WatchdogConfig.defaultPostReconnectGraceSec
         }
-        let presets = WatchdogEndpoint.defaultPresets
-        if copy.endpoints.map(\.urlString) == presets.dropLast().map(\.urlString) {
-            copy.endpoints.append(WatchdogEndpoint.telegramPreset)
+        let presetURLSet = Set(WatchdogEndpoint.defaultPresets.map(\.urlString))
+        for idx in copy.endpoints.indices where presetURLSet.contains(copy.endpoints[idx].urlString) {
+            if copy.endpoints[idx].timeoutSec == 3 || copy.endpoints[idx].timeoutSec == 4 {
+                copy.endpoints[idx].timeoutSec = WatchdogEndpoint.defaultTimeoutSec
+            }
         }
         return copy.clamped()
     }

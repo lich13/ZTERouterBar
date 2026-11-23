@@ -11,8 +11,10 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
 
     private var dashboardWindow: NSWindow?
     private var isPopoverShown = false
+    private var isTerminating = false
     private var registeredHotkeyState: Bool?
     private var lastRenderedSignature: String = ""
+    private var appActivityObservers: [NSObjectProtocol] = []
 
     init(viewModel: RouterViewModel) {
         self.viewModel = viewModel
@@ -20,6 +22,14 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         self.popover = NSPopover()
         super.init()
 
+        viewModel.terminateHandler = { [weak self] in
+            if let self {
+                self.terminateNow()
+            } else {
+                NSApplication.shared.terminate(nil)
+            }
+        }
+        registerAppActivityObservers()
         configureStatusButton()
         configurePopover()
         observeState()
@@ -62,8 +72,16 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         return hosting
     }
 
-    private func quitByUser() {
+    func quitByUser() {
         viewModel.noteUserQuit()
+        terminateNow()
+    }
+
+    private func terminateNow() {
+        guard !isTerminating else { return }
+        isTerminating = true
+        popover.animates = false
+        popover.close()
         NSApplication.shared.terminate(nil)
     }
 
@@ -236,6 +254,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         guard let button = statusItem.button else { return }
         viewModel.prepareCredentialsForInteractiveMenuOrPopover()
         let content = makePopoverContent()
+        popover.animates = true
         popover.contentViewController = content
         popover.contentSize = content.view.fittingSize
         isPopoverShown = true
@@ -251,6 +270,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
     func popoverDidClose(_ notification: Notification) {
         popover.contentViewController = nil
         isPopoverShown = false
+        guard !isTerminating else { return }
         updateActiveState()
     }
 
@@ -426,8 +446,38 @@ final class StatusBarController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         }
     }
 
+    private func registerAppActivityObservers() {
+        let center = NotificationCenter.default
+        let activeObs = center.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.updateActiveState()
+            }
+        }
+        let resignObs = center.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.updateActiveState()
+            }
+        }
+        appActivityObservers = [activeObs, resignObs]
+    }
+
     private func updateActiveState() {
+        guard !isTerminating else { return }
         let windowVisible = dashboardWindow?.isVisible ?? false
-        viewModel.setUIActive(isPopoverShown || windowVisible)
+        let uiVisible = isPopoverShown || windowVisible
+        let blockingQuit = WiFiOnlyLifecycleStateMachine.shouldBlockAutoQuit(
+            isPopoverShown: isPopoverShown,
+            isDashboardVisible: windowVisible,
+            isAppActive: NSApp.isActive
+        )
+        viewModel.setUIState(isVisible: uiVisible, isBlockingAutoQuit: blockingQuit)
     }
 }

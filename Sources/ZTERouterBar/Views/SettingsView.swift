@@ -303,7 +303,7 @@ struct SettingsView: View {
             }
 
             Text(viewModel.canUseWiFiOnlyLaunch
-                ? "「仅连接已绑定 Wi-Fi 时启动」：平时不常驻；连上任一配置绑定的 Wi-Fi 时由系统自动拉起，离开约 60 秒后自动退出。在该 Wi-Fi 下手动退出后，需重新连接该 Wi-Fi 或手动打开才会再次启动。"
+                ? "「仅连接已绑定 Wi-Fi 时启动」：平时不常驻；连上任一配置绑定的 Wi-Fi 时由系统即时拉起，切到其他 Wi-Fi 或关闭 Wi-Fi 后约 1.5 秒自动退出（短暂断连留有 8 秒漫游缓冲）。在该 Wi-Fi 下手动退出后，需重新连接该 Wi-Fi 或手动打开才会再次启动。"
                 : "「仅连接已绑定 Wi-Fi 时启动」需要先为路由器配置绑定 Wi-Fi 名称，并授权定位权限以识别当前 Wi-Fi。")
                 .font(.caption)
                 .foregroundStyle(.secondary)

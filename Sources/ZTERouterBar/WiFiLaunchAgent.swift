@@ -11,6 +11,7 @@ import ZTERouterCore
 enum WiFiLaunchAgent {
     static let label = "com.zte.routerbar.wifi-trigger"
     static let triggerArgument = "--wifi-trigger"
+    static let launchedByTriggerArgument = WiFiOnlyLifecycleStateMachine.launchedByTriggerArgument
 
     private static let eventStream = "com.apple.notifyd.matching"
     private static let networkChangeNotification = "com.apple.system.config.network_change"
@@ -35,6 +36,21 @@ enum WiFiLaunchAgent {
 
     private static var serviceTarget: String { "gui/\(getuid())/\(label)" }
 
+    private static func expectedPlist(executablePath: String, bundleIdentifier: String) -> NSDictionary {
+        [
+            "Label": label,
+            "ProgramArguments": [executablePath, triggerArgument],
+            "RunAtLoad": true,
+            "ThrottleInterval": 1,
+            "ProcessType": "Interactive",
+            "LimitLoadToSessionType": "Aqua",
+            "AssociatedBundleIdentifiers": [bundleIdentifier],
+            "LaunchEvents": [
+                eventStream: ["network-change": ["Notification": networkChangeNotification]]
+            ]
+        ]
+    }
+
     // MARK: - Registration (called from the running app)
 
     static func install() throws {
@@ -42,17 +58,10 @@ enum WiFiLaunchAgent {
               let executablePath = Bundle.main.executablePath else {
             throw AgentError.notRunningFromAppBundle
         }
-        let plist: [String: Any] = [
-            "Label": label,
-            "ProgramArguments": [executablePath, triggerArgument],
-            "RunAtLoad": true,
-            "ProcessType": "Background",
-            "LimitLoadToSessionType": "Aqua",
-            "AssociatedBundleIdentifiers": [Bundle.main.bundleIdentifier ?? "com.zte.routerbar"],
-            "LaunchEvents": [
-                eventStream: ["network-change": ["Notification": networkChangeNotification]]
-            ]
-        ]
+        let plist = expectedPlist(
+            executablePath: executablePath,
+            bundleIdentifier: Bundle.main.bundleIdentifier ?? "com.zte.routerbar"
+        )
         let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
         try FileManager.default.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: plistURL, options: .atomic)
@@ -75,10 +84,19 @@ enum WiFiLaunchAgent {
         try? FileManager.default.removeItem(at: plistURL)
     }
 
-    /// Re-registers when the plist is missing, points at another copy of the app, or is not loaded.
+    /// Re-registers when the plist is missing, outdated, points at another copy of the app, or is not loaded.
     static func syncIfNeeded() {
-        let registeredPath = (NSDictionary(contentsOf: plistURL)?["ProgramArguments"] as? [String])?.first
-        if registeredPath == Bundle.main.executablePath, launchctl("print", serviceTarget) == 0 {
+        guard Bundle.main.bundleURL.pathExtension == "app",
+              let executablePath = Bundle.main.executablePath else {
+            return
+        }
+        let expected = expectedPlist(
+            executablePath: executablePath,
+            bundleIdentifier: Bundle.main.bundleIdentifier ?? "com.zte.routerbar"
+        )
+        if let existing = NSDictionary(contentsOf: plistURL),
+           existing.isEqual(expected),
+           launchctl("print", serviceTarget) == 0 {
             return
         }
         do {
@@ -93,7 +111,7 @@ enum WiFiLaunchAgent {
         run("/bin/launchctl", arguments)
     }
 
-    private static func run(_ executable: String, _ arguments: [String]) -> Int32 {
+    fileprivate static func run(_ executable: String, _ arguments: [String]) -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -112,11 +130,16 @@ enum WiFiLaunchAgent {
 
     /// Remembers the Wi-Fi the user quit on, so the trigger does not bring the app straight back.
     static func suppressLaunch(onSSID ssid: String) {
-        UserDefaults.standard.set(ssid, forKey: SettingsKeys.wifiLaunchSuppressedSSID)
+        let trimmed = ssid.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        UserDefaults.standard.set(trimmed, forKey: SettingsKeys.wifiLaunchSuppressedSSID)
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
     }
 
     static func clearSuppression() {
+        guard UserDefaults.standard.object(forKey: SettingsKeys.wifiLaunchSuppressedSSID) != nil else { return }
         UserDefaults.standard.removeObject(forKey: SettingsKeys.wifiLaunchSuppressedSSID)
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
     }
 
     // MARK: - Trigger process (launchd job; never starts AppKit)
@@ -125,46 +148,109 @@ enum WiFiLaunchAgent {
         // A private queue, not `.main`: under `dispatchMain()` the main queue is not drained on the
         // main thread, which trips Swift's main-actor checks for closures sent to it.
         let queue = DispatchQueue(label: label)
-        // launchd requires jobs with LaunchEvents to check in, or it keeps relaunching them.
-        xpc_set_event_stream_handler(eventStream, queue) { _ in }
-        // Network changes arrive in bursts while Wi-Fi is still associating; let it settle.
-        queue.asyncAfter(deadline: .now() + 1.0) {
-            let action = decideAndLaunch()
-            logger.notice("wifi-trigger: \(action, privacy: .public)")
-            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
-            exit(0)
+        let coordinator = TriggerCoordinator(queue: queue)
+        // launchd requires jobs with LaunchEvents to check in, or it keeps relaunching them;
+        // any follow-up `network_change` event delivered while alive extends the poll window so it is never lost.
+        xpc_set_event_stream_handler(eventStream, queue) { _ in
+            coordinator.handleEvent(isInitial: false)
+        }
+        queue.async {
+            coordinator.handleEvent(isInitial: true)
         }
         dispatchMain()
     }
 
-    private static func decideAndLaunch() -> String {
+    fileprivate static func evaluateStep(
+        policy: inout WiFiTriggerPollPolicy,
+        isInitialEvent: Bool?,
+        now: ContinuousClock.Instant = ContinuousClock.now
+    ) -> WiFiTriggerStepDecision {
         let defaults = UserDefaults.standard
-        guard defaults.bool(forKey: SettingsKeys.wifiOnlyLaunch) else { return "mode disabled" }
-
-        let rawSSID = CWWiFiClient.shared().interface()?.ssid()?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let ssid = (rawSSID?.isEmpty == false) ? rawSSID : nil
-
-        let suppressedSSID = defaults.string(forKey: SettingsKeys.wifiLaunchSuppressedSSID)
-        if let suppressedSSID, suppressedSSID != ssid {
-            // Left (or switched away from) the Wi-Fi the user quit on: the next join launches again.
-            defaults.removeObject(forKey: SettingsKeys.wifiLaunchSuppressedSSID)
-        }
-
+        let iface = CWWiFiClient.shared().interface()
+        let poweredOn = iface?.powerOn() ?? false
+        let rawSSID = iface?.ssid()
         let profiles = defaults.data(forKey: SettingsKeys.profiles)
             .flatMap { try? JSONDecoder().decode([RouterProfile].self, from: $0) } ?? []
-        guard RouterProfileMatcher.match(ssid: ssid, in: profiles) != nil else {
-            return ssid == nil ? "no Wi-Fi name available, not launching" : "Wi-Fi not bound to a profile, not launching"
+
+        let previousSuppressed = defaults.string(forKey: SettingsKeys.wifiLaunchSuppressedSSID)
+        var updatedSuppressed = previousSuppressed
+
+        let decision = policy.evaluateStep(
+            wifiOnlyLaunch: defaults.bool(forKey: SettingsKeys.wifiOnlyLaunch),
+            poweredOn: poweredOn,
+            rawSSID: rawSSID,
+            profiles: profiles,
+            suppressedSSID: &updatedSuppressed,
+            isInitialEvent: isInitialEvent,
+            now: now,
+            performLaunch: {
+                let bundleID = Bundle.main.bundleIdentifier ?? "com.zte.routerbar"
+                if NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+                    .contains(where: { $0.processIdentifier != getpid() }) {
+                    // `open` on a running app would send a reopen event and pop the dashboard.
+                    return "bound Wi-Fi, app already running"
+                }
+                let status = run("/usr/bin/open", ["-g", Bundle.main.bundleURL.path, "--args", launchedByTriggerArgument])
+                return status == 0 ? "bound Wi-Fi, launched app" : "bound Wi-Fi, open failed (\(status))"
+            }
+        )
+
+        if updatedSuppressed != previousSuppressed {
+            if let updatedSuppressed {
+                defaults.set(updatedSuppressed, forKey: SettingsKeys.wifiLaunchSuppressedSSID)
+            } else {
+                defaults.removeObject(forKey: SettingsKeys.wifiLaunchSuppressedSSID)
+            }
         }
-        if suppressedSSID == ssid {
-            return "bound Wi-Fi, but user quit on it; not launching"
+
+        return decision
+    }
+}
+
+private final class TriggerCoordinator: @unchecked Sendable {
+    private static let logger = Logger(subsystem: "com.zte.routerbar", category: "wifi-trigger")
+    private let queue: DispatchQueue
+    private var policy: WiFiTriggerPollPolicy
+    private var timerScheduled = false
+
+    init(queue: DispatchQueue) {
+        self.queue = queue
+        self.policy = WiFiTriggerPollPolicy(startedAt: ContinuousClock.now)
+    }
+
+    func handleEvent(isInitial: Bool) {
+        let decision = WiFiLaunchAgent.evaluateStep(
+            policy: &policy,
+            isInitialEvent: isInitial
+        )
+        apply(decision)
+    }
+
+    private func scheduleTickIfNeeded() {
+        guard !timerScheduled else { return }
+        timerScheduled = true
+        queue.asyncAfter(deadline: .now() + .milliseconds(300)) { [self] in
+            timerScheduled = false
+            let decision = WiFiLaunchAgent.evaluateStep(
+                policy: &policy,
+                isInitialEvent: nil
+            )
+            apply(decision)
         }
-        let bundleID = Bundle.main.bundleIdentifier ?? "com.zte.routerbar"
-        if NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
-            .contains(where: { $0.processIdentifier != getpid() }) {
-            // `open` on a running app would send a reopen event and pop the dashboard.
-            return "bound Wi-Fi, app already running"
+    }
+
+    private func apply(_ decision: WiFiTriggerStepDecision) {
+        switch decision {
+        case let .finish(action):
+            finish(action)
+        case .scheduleNextTick:
+            scheduleTickIfNeeded()
         }
-        let status = run("/usr/bin/open", ["-g", Bundle.main.bundleURL.path])
-        return status == 0 ? "bound Wi-Fi, launched app" : "bound Wi-Fi, open failed (\(status))"
+    }
+
+    private func finish(_ action: String) -> Never {
+        Self.logger.notice("wifi-trigger: \(action, privacy: .public)")
+        CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
+        exit(0)
     }
 }

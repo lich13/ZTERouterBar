@@ -6,7 +6,9 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import java.net.HttpURLConnection
 import java.net.Inet4Address
+import java.net.URL
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,6 +22,7 @@ data class WifiLanState(
 interface WifiLanMonitor {
     val state: StateFlow<WifiLanState>
     fun currentWifiNetwork(): Network?
+    fun openProbeConnection(url: URL): HttpURLConnection = url.openConnection() as HttpURLConnection
     fun refresh()
     fun close()
 }
@@ -88,6 +91,34 @@ class AndroidWifiLanMonitor(context: Context) : WifiLanMonitor {
     }
 
     override fun currentWifiNetwork(): Network? = primaryWifiNetwork
+
+    override fun openProbeConnection(url: URL): HttpURLConnection {
+        val cm = connectivityManager ?: return url.openConnection() as HttpURLConnection
+        val wifiNet = primaryWifiNetwork
+        val active = runCatching { cm.activeNetwork }.getOrNull()
+        val activeCaps = active?.let { runCatching { cm.getNetworkCapabilities(it) }.getOrNull() }
+        val activeHasVpn = activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+        val activeHasWifi = activeCaps != null &&
+            activeCaps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+            activeCaps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        val activeHasWiredLan = activeCaps != null && (
+            activeCaps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ||
+                activeCaps.hasTransport(NetworkCapabilities.TRANSPORT_USB)
+            )
+        val boundWifi = wifiNet ?: active?.takeIf { activeHasWifi }
+
+        return when (
+            resolveProbeNetworkRoute(
+                hasWifiNetwork = boundWifi != null,
+                activeHasVpn = activeHasVpn,
+                activeHasWiredLan = activeHasWiredLan
+            )
+        ) {
+            ProbeNetworkRoute.SYSTEM_DEFAULT -> url.openConnection() as HttpURLConnection
+            ProbeNetworkRoute.BOUND_WIFI -> requireNotNull(boundWifi).openConnection(url) as HttpURLConnection
+            ProbeNetworkRoute.BOUND_ACTIVE_LAN -> requireNotNull(active).openConnection(url) as HttpURLConnection
+        }
+    }
 
     override fun refresh() {
         val cm = connectivityManager ?: return
@@ -159,4 +190,21 @@ class AndroidWifiLanMonitor(context: Context) : WifiLanMonitor {
             }?.gateway?.hostAddress
         }
     }
+}
+
+internal enum class ProbeNetworkRoute {
+    SYSTEM_DEFAULT,
+    BOUND_WIFI,
+    BOUND_ACTIVE_LAN
+}
+
+internal fun resolveProbeNetworkRoute(
+    hasWifiNetwork: Boolean,
+    activeHasVpn: Boolean,
+    activeHasWiredLan: Boolean
+): ProbeNetworkRoute = when {
+    activeHasVpn -> ProbeNetworkRoute.SYSTEM_DEFAULT
+    hasWifiNetwork -> ProbeNetworkRoute.BOUND_WIFI
+    activeHasWiredLan -> ProbeNetworkRoute.BOUND_ACTIVE_LAN
+    else -> ProbeNetworkRoute.SYSTEM_DEFAULT
 }

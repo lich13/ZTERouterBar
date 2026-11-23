@@ -297,26 +297,26 @@ struct ZTERouterCoreTests {
         #expect(cfg.autoStart == true)
         #expect(cfg.autoReconnectEnabled == false)
         #expect(cfg.triggerPolicy == .weighted)
-        #expect(cfg.failureWindowSec == 60)
+        #expect(cfg.failureWindowSec == 15)
         #expect(cfg.recheckIntervalSec == 5)
-        #expect(cfg.postReconnectGraceSec == 300)
+        #expect(cfg.postReconnectGraceSec == 180)
         #expect(cfg.maxConsecutiveReconnects == 3)
         #expect(cfg.cooldownSec == 300)
         #expect(cfg.endpoints.count == 4)
         #expect(cfg.endpoints[3].urlString == "https://api.telegram.org/")
         #expect(cfg.endpoints[3].weight == 1)
         #expect(cfg.endpoints[3].intervalSec == 33)
-        #expect(cfg.endpoints[3].timeoutSec == 4)
+        #expect(cfg.endpoints[3].timeoutSec == 10)
         #expect(cfg.endpoints[0].urlString == "https://661313.xyz/test/generate_204")
         #expect(cfg.endpoints[0].weight == 1)
         #expect(cfg.endpoints[0].intervalSec == 15)
-        #expect(cfg.endpoints[0].timeoutSec == 3)
+        #expect(cfg.endpoints[0].timeoutSec == 10)
         #expect(cfg.endpoints[1].weight == 1)
         #expect(cfg.endpoints[1].intervalSec == 33)
-        #expect(cfg.endpoints[1].timeoutSec == 4)
+        #expect(cfg.endpoints[1].timeoutSec == 10)
         #expect(cfg.endpoints[2].weight == 1)
         #expect(cfg.endpoints[2].intervalSec == 33)
-        #expect(cfg.endpoints[2].timeoutSec == 4)
+        #expect(cfg.endpoints[2].timeoutSec == 10)
         #expect(cfg.endpoints.allSatisfy { $0.isValidHTTPURL && $0.urlString.hasPrefix("https://") })
         #expect(!cfg.endpoints.contains(where: { $0.urlString.contains("success.txt") || $0.urlString.contains("github") || $0.urlString.contains("dropbox") }))
 
@@ -344,14 +344,14 @@ struct ZTERouterCoreTests {
         let migrated104 = decoded104.migratingLegacyDefaults(fromVersion: 3)
         #expect(migrated104.endpoints[0].urlString == "https://661313.xyz/test/generate_204")
         #expect(migrated104.endpoints[0].intervalSec == 15)
-        #expect(migrated104.endpoints[0].timeoutSec == 3)
+        #expect(migrated104.endpoints[0].timeoutSec == 10)
         #expect(migrated104.endpoints[1].intervalSec == 25)
         #expect(migrated104.endpoints[1].timeoutSec == 5)
         #expect(migrated104.endpoints[0].weight == 1)
         #expect(migrated104.recheckIntervalSec == 5)
         #expect(migrated104.cooldownSec == 300)
-        #expect(migrated104.failureWindowSec == 60)
-        #expect(migrated104.postReconnectGraceSec == 300)
+        #expect(migrated104.failureWindowSec == 15)
+        #expect(migrated104.postReconnectGraceSec == 180)
         #expect(migrated104.autoReconnectEnabled == false)
 
         // v1.0.5 (defaults version 4) config with user-tuned timeouts: only the hair-trigger defaults change.
@@ -377,14 +377,14 @@ struct ZTERouterCoreTests {
         #expect(migrated105.endpoints.map(\.intervalSec) == [15, 33, 20])
         #expect(migrated105.recheckIntervalSec == 5)
         #expect(migrated105.cooldownSec == 300)
-        #expect(migrated105.failureWindowSec == 60)
-        #expect(migrated105.postReconnectGraceSec == 300)
+        #expect(migrated105.failureWindowSec == 15)
+        #expect(migrated105.postReconnectGraceSec == 180)
         #expect(migrated105.endpoints.count == 3)
         // Already-migrated configs keep whatever the user chose afterwards.
         var tuned = migrated105
         tuned.recheckIntervalSec = 3
         tuned.cooldownSec = 60
-        #expect(tuned.migratingLegacyDefaults(fromVersion: 6) == tuned)
+        #expect(tuned.migratingLegacyDefaults(fromVersion: 7) == tuned)
 
         // v1.1.0 (defaults version 5): untouched 30s/45s defaults and the 3-preset list move to the
         // new defaults; values the user tuned and custom endpoint lists stay as they are.
@@ -393,15 +393,33 @@ struct ZTERouterCoreTests {
             postReconnectGraceSec: 45,
             endpoints: Array(WatchdogEndpoint.defaultPresets.dropLast())
         ).migratingLegacyDefaults(fromVersion: 5)
-        #expect(v110.failureWindowSec == 60)
-        #expect(v110.postReconnectGraceSec == 300)
+        #expect(v110.failureWindowSec == 15)
+        #expect(v110.postReconnectGraceSec == 180)
         #expect(v110.endpoints.map(\.urlString) == WatchdogEndpoint.defaultPresets.map(\.urlString))
+        #expect(v110.endpoints.allSatisfy { $0.timeoutSec == 10 })
         let v110Tuned = WatchdogConfig(
             failureWindowSec: 40,
             postReconnectGraceSec: 90,
             endpoints: [WatchdogEndpoint(name: "Custom", urlString: "https://custom.invalid/ping")]
         )
         #expect(v110Tuned.migratingLegacyDefaults(fromVersion: 5) == v110Tuned)
+
+        // defaults version 6 -> 7: untouched 60s/300s and 3s/4s preset timeouts migrate to 15s/180s/10s
+        // while preserving custom weights and without re-adding Telegram if removed on v6.
+        let v6Config = WatchdogConfig(
+            failureWindowSec: 60,
+            postReconnectGraceSec: 300,
+            endpoints: [
+                WatchdogEndpoint(name: "661313 204", urlString: "https://661313.xyz/test/generate_204", weight: 2, intervalSec: 15, timeoutSec: 3),
+                WatchdogEndpoint(name: "YouTube 204", urlString: "https://www.youtube.com/generate_204", weight: 1, intervalSec: 33, timeoutSec: 4),
+                WatchdogEndpoint(name: "Cloudflare DoH", urlString: "https://cloudflare-dns.com/cdn-cgi/trace", weight: 1, intervalSec: 33, timeoutSec: 4)
+            ]
+        ).migratingLegacyDefaults(fromVersion: 6)
+        #expect(v6Config.failureWindowSec == 15)
+        #expect(v6Config.postReconnectGraceSec == 180)
+        #expect(v6Config.endpoints.count == 3)
+        #expect(v6Config.endpoints.map(\.weight) == [2, 1, 1])
+        #expect(v6Config.endpoints.map(\.timeoutSec) == [10, 10, 10])
 
         // Legacy untouched preset sets migrate cleanly to v1.1.0 defaults
         for oldURLs in WatchdogEndpoint.legacyPresetURLSets {
@@ -485,15 +503,15 @@ struct ZTERouterCoreTests {
 
         #expect(await router.reconnectCount == 0)
         let phases = await collector.phases
-        #expect(phases.contains(.confirming(elapsedSec: 0, windowSec: 60)))
-        #expect(phases.contains(.confirming(elapsedSec: 5, windowSec: 60)))
+        #expect(phases.contains(.confirming(elapsedSec: 0, windowSec: 15)))
+        #expect(phases.contains(.confirming(elapsedSec: 5, windowSec: 15)))
         #expect(!phases.contains(.reconnecting))
         #expect(await collector.probeFailureCount == 1)
     }
 
     @Test("With auto reconnect off, a sustained failure notifies once and never redials")
     func testWatchdogAutoReconnectDisabledOnlyNotifies() async {
-        // 1 failing round + 12 failing rechecks fill the window, then the outage simply continues.
+        // 1 failing round + failing rechecks fill the window, then the outage simply continues.
         let prober = ScriptedProber(roundResults: Array(repeating: false, count: 40))
         let router = MockReconnectRouter()
         var cfg = WatchdogConfig()
@@ -519,8 +537,8 @@ struct ZTERouterCoreTests {
 
     @Test("Watchdog reconnects once after a full failure window, then stays silent for the grace period")
     func testWatchdogSustainedFailureReconnectsOnceThenSettles() async {
-        // 1 failing round + 12 failing rechecks (12 x 5s = 60s window) -> reconnect -> recovered afterwards.
-        let prober = ScriptedProber(roundResults: Array(repeating: false, count: 13))
+        // 1 failing round + 3 failing rechecks (3 x 5s = 15s default window) -> reconnect -> recovered afterwards.
+        let prober = ScriptedProber(roundResults: Array(repeating: false, count: 4))
         let router = MockReconnectRouter()
         var cfg = WatchdogConfig(autoReconnectEnabled: true)
         cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid")]
@@ -536,7 +554,7 @@ struct ZTERouterCoreTests {
                 await collector.record(event)
             }
         }
-        await Self.waitUntil { await prober.completedRounds >= 16 }
+        await Self.waitUntil { await prober.completedRounds >= 7 }
         task.cancel()
         await task.value
 
@@ -547,15 +565,15 @@ struct ZTERouterCoreTests {
 
         let phases = await collector.phases
         let beforeReconnect = phases.prefix { $0 != .reconnecting }
-        #expect(beforeReconnect.filter(Self.isConfirming).count == 12)
-        #expect(phases.contains(.settling(seconds: 300)))
+        #expect(beforeReconnect.filter(Self.isConfirming).count == 3)
+        #expect(phases.contains(.settling(seconds: 180)))
         #expect(!phases.contains(.coolingDown(seconds: 300)))
 
         // The grace period is one uninterrupted sleep: no probe happens inside it.
         let recorded = await sleeps.durations
-        #expect(recorded.contains(.seconds(300)))
-        let graceIndex = recorded.firstIndex(of: .seconds(300))
-        #expect(graceIndex.map { recorded[..<$0].filter { $0 == .seconds(5) }.count } == 12)
+        #expect(recorded.contains(.seconds(180)))
+        let graceIndex = recorded.firstIndex(of: .seconds(180))
+        #expect(graceIndex.map { recorded[..<$0].filter { $0 == .seconds(5) }.count } == 3)
     }
 
     @Test("Slow failing probes count toward the failure window")
@@ -563,7 +581,7 @@ struct ZTERouterCoreTests {
         // Each failing recheck takes 10s on top of the 5s pause: 4 rechecks cover the 60s window.
         let prober = ScriptedProber(roundResults: Array(repeating: false, count: 5), elapsedMs: 10_000)
         let router = MockReconnectRouter()
-        var cfg = WatchdogConfig(autoReconnectEnabled: true)
+        var cfg = WatchdogConfig(autoReconnectEnabled: true, failureWindowSec: 60)
         cfg.endpoints = [WatchdogEndpoint(name: "Test", urlString: "https://example.invalid", timeoutSec: 10)]
 
         let collector = PhaseCollector()
@@ -958,6 +976,426 @@ struct ZTERouterCoreTests {
         #expect(phases.contains(.confirming(elapsedSec: 0, windowSec: 60)))
         #expect(phases.contains(.confirming(elapsedSec: 9, windowSec: 60)))
         #expect(!phases.contains(.reconnecting))
+    }
+
+    @Test("WiFiOnlyLifecycleStateMachine suspends immediately, escalates roam grace to definite leave, and ignores unfocused windows")
+    func testWiFiOnlyLifecycleStateMachine() {
+        // 1. Manual launch on unbound Wi-Fi stays active and never schedules auto-quit.
+        var manual = WiFiOnlyLifecycleStateMachine(launchedByWiFiTrigger: false)
+        let manualEval = manual.evaluate(
+            wifiOnlyLaunch: true,
+            currentSSID: "CoffeeShop_WiFi",
+            isWiFiPoweredOn: true,
+            isBoundWiFiMatched: false
+        )
+        #expect(manual.sawBoundWiFi == false)
+        #expect(manualEval == WiFiOnlyLifecycleEvaluation(isSuspendedOutsideBoundWiFi: false, timerAction: .none))
+
+        // 2. Launch via `--launched-by-wifi-trigger` marks sawBoundWiFi=true even if SSID is momentarily nil,
+        //    then cancels timer cleanly once bound SSID resolves.
+        var triggered = WiFiOnlyLifecycleStateMachine(launchedByWiFiTrigger: true)
+        let initNilEval = triggered.evaluate(
+            wifiOnlyLaunch: true,
+            currentSSID: nil,
+            isWiFiPoweredOn: true,
+            isBoundWiFiMatched: false
+        )
+        #expect(triggered.sawBoundWiFi == true)
+        #expect(initNilEval == WiFiOnlyLifecycleEvaluation(isSuspendedOutsideBoundWiFi: true, timerAction: .startTimer(.roamGrace)))
+        #expect(WiFiLeaveQuitTier.roamGrace.delay == .seconds(8))
+
+        let joinedEval = triggered.evaluate(
+            wifiOnlyLaunch: true,
+            currentSSID: "Pocket_5G",
+            isWiFiPoweredOn: true,
+            isBoundWiFiMatched: true
+        )
+        #expect(joinedEval == WiFiOnlyLifecycleEvaluation(isSuspendedOutsideBoundWiFi: false, timerAction: .cancelTimer))
+
+        // 3. Leaving bound Wi-Fi: nil SSID starts 8s roamGrace -> switching to known unbound SSID escalates to 1.5s definiteLeave,
+        //    and subsequent nil/unbound events never restart or lengthen the 1.5s timer.
+        let dropToNil = triggered.evaluate(
+            wifiOnlyLaunch: true,
+            currentSSID: nil,
+            isWiFiPoweredOn: true,
+            isBoundWiFiMatched: false
+        )
+        #expect(dropToNil == WiFiOnlyLifecycleEvaluation(isSuspendedOutsideBoundWiFi: true, timerAction: .startTimer(.roamGrace)))
+
+        let switchToOther = triggered.evaluate(
+            wifiOnlyLaunch: true,
+            currentSSID: "Home_WiFi",
+            isWiFiPoweredOn: true,
+            isBoundWiFiMatched: false
+        )
+        #expect(switchToOther == WiFiOnlyLifecycleEvaluation(isSuspendedOutsideBoundWiFi: true, timerAction: .startTimer(.definiteLeave)))
+        #expect(WiFiLeaveQuitTier.definiteLeave.delay == .milliseconds(1500))
+
+        let briefNilBetweenUnbound = triggered.evaluate(
+            wifiOnlyLaunch: true,
+            currentSSID: nil,
+            isWiFiPoweredOn: true,
+            isBoundWiFiMatched: false
+        )
+        #expect(briefNilBetweenUnbound == WiFiOnlyLifecycleEvaluation(isSuspendedOutsideBoundWiFi: true, timerAction: .none))
+
+        // 4. Unfocused background dashboard does NOT block auto-quit; focused dashboard / open popover defers until unfocused.
+        #expect(WiFiOnlyLifecycleStateMachine.shouldBlockAutoQuit(isPopoverShown: false, isDashboardVisible: true, isAppActive: false) == false)
+        #expect(WiFiOnlyLifecycleStateMachine.shouldBlockAutoQuit(isPopoverShown: false, isDashboardVisible: true, isAppActive: true) == true)
+        #expect(WiFiOnlyLifecycleStateMachine.shouldBlockAutoQuit(isPopoverShown: true, isDashboardVisible: false, isAppActive: false) == true)
+
+        #expect(triggered.timerDidFire(wifiOnlyLaunch: true, isBoundWiFiMatched: false, isBlockingAutoQuit: true) == false)
+        #expect(triggered.quitDeferredByBlockingUI == true)
+        #expect(triggered.noteBlockingUIChanged(isBlockingAutoQuit: true, wifiOnlyLaunch: true, isBoundWiFiMatched: false) == false)
+        #expect(triggered.noteBlockingUIChanged(isBlockingAutoQuit: false, wifiOnlyLaunch: true, isBoundWiFiMatched: false) == true)
+
+        // 5. Turning Wi-Fi power off from roamGrace also escalates immediately to 1.5s definiteLeave.
+        var powerOffSM = WiFiOnlyLifecycleStateMachine(launchedByWiFiTrigger: true)
+        _ = powerOffSM.evaluate(wifiOnlyLaunch: true, currentSSID: nil, isWiFiPoweredOn: true, isBoundWiFiMatched: false)
+        let powerOffEval = powerOffSM.evaluate(wifiOnlyLaunch: true, currentSSID: nil, isWiFiPoweredOn: false, isBoundWiFiMatched: false)
+        #expect(powerOffEval == WiFiOnlyLifecycleEvaluation(isSuspendedOutsideBoundWiFi: true, timerAction: .startTimer(.definiteLeave)))
+        #expect(powerOffSM.timerDidFire(wifiOnlyLaunch: true, isBoundWiFiMatched: false, isBlockingAutoQuit: false) == true)
+
+        // 6. If bound Wi-Fi rejoins while UI was deferring auto-quit, closing/unfocusing UI does not quit and clears suspension.
+        var deferredRejoin = WiFiOnlyLifecycleStateMachine(launchedByWiFiTrigger: true)
+        _ = deferredRejoin.evaluate(wifiOnlyLaunch: true, currentSSID: "Other_WiFi", isWiFiPoweredOn: true, isBoundWiFiMatched: false)
+        #expect(deferredRejoin.timerDidFire(wifiOnlyLaunch: true, isBoundWiFiMatched: false, isBlockingAutoQuit: true) == false)
+        #expect(deferredRejoin.isSuspendedOutsideBoundWiFi == true)
+        #expect(deferredRejoin.noteBlockingUIChanged(isBlockingAutoQuit: false, wifiOnlyLaunch: true, isBoundWiFiMatched: true) == false)
+        #expect(deferredRejoin.isSuspendedOutsideBoundWiFi == false)
+    }
+
+    @Test("WiFiTriggerPollPolicy grants 4.5s association window on unbound-to-nil transition and caps XPC extensions at 12s")
+    func testWiFiTriggerPollPolicy() {
+        let t0 = ContinuousClock.now
+
+        // 1. Direct switch from unbound Wi-Fi -> nil (associating) -> bound Wi-Fi:
+        //    t=0 sees old unbound SSID (1.2s burst), t=300ms transitions to nil and must receive full 4.5s association window.
+        var policy = WiFiTriggerPollPolicy(startedAt: t0)
+        #expect(policy.evaluateEvent(result: .retryBriefBurst("Wi-Fi not bound"), isInitial: true, now: t0) == .scheduleNextTick)
+        #expect(policy.pollDeadline == t0 + .milliseconds(1200))
+        #expect(policy.grantedAssociationWindow == false)
+
+        let t300 = t0 + .milliseconds(300)
+        #expect(policy.evaluateTick(result: .retryWhileAssociating("no Wi-Fi name available"), now: t300) == .scheduleNextTick)
+        #expect(policy.grantedAssociationWindow == true)
+        #expect(policy.pollDeadline == t300 + .milliseconds(4500))
+
+        // Still associating at t=2.1s -> must NOT abort prematurely.
+        let t2100 = t0 + .milliseconds(2100)
+        #expect(policy.evaluateTick(result: .retryWhileAssociating("no Wi-Fi name available"), now: t2100) == .scheduleNextTick)
+
+        // Bound SSID resolves at t=2.4s -> finishes and launches immediately.
+        let t2400 = t0 + .milliseconds(2400)
+        #expect(policy.evaluateTick(result: .terminal("bound Wi-Fi, launched app"), now: t2400) == .finish("bound Wi-Fi, launched app"))
+
+        // 2. Follow-up XPC network_change events extend deadline, clamped strictly to the 12s hard cap.
+        var burstPolicy = WiFiTriggerPollPolicy(startedAt: t0)
+        _ = burstPolicy.evaluateEvent(result: .retryWhileAssociating("no Wi-Fi name available"), isInitial: true, now: t0)
+        #expect(burstPolicy.pollDeadline == t0 + .milliseconds(4500))
+
+        let t9s = t0 + .seconds(9)
+        #expect(burstPolicy.evaluateEvent(result: .retryWhileAssociating("no Wi-Fi name available"), isInitial: false, now: t9s) == .scheduleNextTick)
+        #expect(burstPolicy.pollDeadline == t0 + .seconds(12))
+
+        let t12s = t0 + .seconds(12)
+        #expect(burstPolicy.evaluateTick(result: .retryWhileAssociating("no Wi-Fi name available"), now: t12s) == .finish("no Wi-Fi name available, not launching"))
+    }
+
+    @Test("WiFiTriggerPollPolicy.evaluateStep preserves quit suppression across transient nil roam and clears on genuine leave")
+    func testWiFiTriggerSuppressionLifecycle() {
+        let t0 = ContinuousClock.now
+        let profiles = [
+            RouterProfile(name: "随身路由 A", routerURLString: "http://192.168.0.1", wifiSSIDs: ["Pocket_5G"]),
+            RouterProfile(name: "备用路由 B", routerURLString: "http://192.168.8.1", wifiSSIDs: ["Office_CPE"])
+        ]
+
+        // 1. Transient BSSID roam on the same SSID the user explicitly quit on:
+        //    tick 0 (t=0ms) sees poweredOn=true, ssid=nil -> must NOT clear suppression;
+        //    tick 1 (t=300ms) resolves back to "Pocket_5G" -> must NOT launch and must keep suppression.
+        var roamPolicy = WiFiTriggerPollPolicy(startedAt: t0)
+        var roamSuppressed: String? = "Pocket_5G"
+        var launchCount = 0
+        #expect(
+            roamPolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: nil,
+                profiles: profiles,
+                suppressedSSID: &roamSuppressed,
+                isInitialEvent: true,
+                now: t0,
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .scheduleNextTick
+        )
+        #expect(roamSuppressed == "Pocket_5G")
+        #expect(launchCount == 0)
+
+        #expect(
+            roamPolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: "  Pocket_5G \n",
+                profiles: profiles,
+                suppressedSSID: &roamSuppressed,
+                isInitialEvent: nil,
+                now: t0 + .milliseconds(300),
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .finish("bound Wi-Fi, but user quit on it; not launching")
+        )
+        #expect(roamSuppressed == "Pocket_5G")
+        #expect(launchCount == 0)
+
+        // 2. Genuine disconnect with Wi-Fi powered on (e.g. walked out of range / router powered down):
+        //    suppression stays intact while associating, then clears once the 4.5s association window finishes still with ssid=nil,
+        //    allowing the next join of "Pocket_5G" to launch again.
+        var disconnectPolicy = WiFiTriggerPollPolicy(startedAt: t0)
+        var disconnectSuppressed: String? = "Pocket_5G"
+        #expect(
+            disconnectPolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: nil,
+                profiles: profiles,
+                suppressedSSID: &disconnectSuppressed,
+                isInitialEvent: true,
+                now: t0,
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .scheduleNextTick
+        )
+        #expect(disconnectSuppressed == "Pocket_5G")
+
+        #expect(
+            disconnectPolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: "   ",
+                profiles: profiles,
+                suppressedSSID: &disconnectSuppressed,
+                isInitialEvent: nil,
+                now: t0 + .milliseconds(4200),
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .scheduleNextTick
+        )
+        #expect(disconnectSuppressed == "Pocket_5G")
+
+        #expect(
+            disconnectPolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: nil,
+                profiles: profiles,
+                suppressedSSID: &disconnectSuppressed,
+                isInitialEvent: nil,
+                now: t0 + .milliseconds(4500),
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .finish("no Wi-Fi name available, not launching")
+        )
+        #expect(disconnectSuppressed == nil)
+        #expect(launchCount == 0)
+
+        var rejoinPolicy = WiFiTriggerPollPolicy(startedAt: t0 + .seconds(10))
+        #expect(
+            rejoinPolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: "Pocket_5G",
+                profiles: profiles,
+                suppressedSSID: &disconnectSuppressed,
+                isInitialEvent: true,
+                now: t0 + .seconds(10),
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .finish("bound Wi-Fi, launched app")
+        )
+        #expect(launchCount == 1)
+
+        // 3. Turning Wi-Fi power off clears suppression immediately on tick 0 (even if rawSSID had cached text).
+        var powerOffPolicy = WiFiTriggerPollPolicy(startedAt: t0)
+        var powerOffSuppressed: String? = "Pocket_5G"
+        #expect(
+            powerOffPolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: false,
+                rawSSID: "Pocket_5G",
+                profiles: profiles,
+                suppressedSSID: &powerOffSuppressed,
+                isInitialEvent: true,
+                now: t0,
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .finish("Wi-Fi powered off, not launching")
+        )
+        #expect(powerOffSuppressed == nil)
+        #expect(launchCount == 1)
+
+        // 4. Switching to an unbound SSID clears suppression immediately; switching to another bound SSID clears suppression and launches.
+        var switchUnboundPolicy = WiFiTriggerPollPolicy(startedAt: t0)
+        var switchSuppressed: String? = "Pocket_5G"
+        #expect(
+            switchUnboundPolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: "Home_WiFi",
+                profiles: profiles,
+                suppressedSSID: &switchSuppressed,
+                isInitialEvent: true,
+                now: t0,
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .scheduleNextTick
+        )
+        #expect(switchSuppressed == nil)
+        #expect(launchCount == 1)
+
+        var switchOtherBoundPolicy = WiFiTriggerPollPolicy(startedAt: t0)
+        var otherBoundSuppressed: String? = "Pocket_5G"
+        #expect(
+            switchOtherBoundPolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: "Office_CPE",
+                profiles: profiles,
+                suppressedSSID: &otherBoundSuppressed,
+                isInitialEvent: true,
+                now: t0,
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .finish("bound Wi-Fi, launched app")
+        )
+        #expect(otherBoundSuppressed == nil)
+        #expect(launchCount == 2)
+
+        // 5. Stale cached SSID on initial network_change when user walks out of range / powers off router:
+        //    t=0ms still reads cached "Pocket_5G" (polls brief burst instead of exiting prematurely),
+        //    t=300ms transitions to nil (grants 4.5s association window), t=4800ms finishes still nil -> lifts suppression.
+        var cachedLeavePolicy = WiFiTriggerPollPolicy(startedAt: t0)
+        var cachedLeaveSuppressed: String? = "Pocket_5G"
+        #expect(
+            cachedLeavePolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: "Pocket_5G",
+                profiles: profiles,
+                suppressedSSID: &cachedLeaveSuppressed,
+                isInitialEvent: true,
+                now: t0,
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .scheduleNextTick
+        )
+        #expect(cachedLeaveSuppressed == "Pocket_5G")
+        #expect(
+            cachedLeavePolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: nil,
+                profiles: profiles,
+                suppressedSSID: &cachedLeaveSuppressed,
+                isInitialEvent: nil,
+                now: t0 + .milliseconds(300),
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .scheduleNextTick
+        )
+        #expect(cachedLeaveSuppressed == "Pocket_5G")
+        #expect(
+            cachedLeavePolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: nil,
+                profiles: profiles,
+                suppressedSSID: &cachedLeaveSuppressed,
+                isInitialEvent: nil,
+                now: t0 + .milliseconds(4800),
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .finish("no Wi-Fi name available, not launching")
+        )
+        #expect(cachedLeaveSuppressed == nil)
+        #expect(launchCount == 2)
+
+        // 6. Case-insensitive roam back to same SSID ("pocket_5g") keeps suppression;
+        //    and a 100ms nil blip truncated by the 12s hardCapDeadline must NOT lift suppression prematurely.
+        var hardCapRoamPolicy = WiFiTriggerPollPolicy(startedAt: t0)
+        var hardCapSuppressed: String? = "Pocket_5G"
+        #expect(
+            hardCapRoamPolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: "pocket_5g",
+                profiles: profiles,
+                suppressedSSID: &hardCapSuppressed,
+                isInitialEvent: true,
+                now: t0,
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .scheduleNextTick
+        )
+        #expect(hardCapSuppressed == "Pocket_5G")
+        #expect(
+            hardCapRoamPolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: nil,
+                profiles: profiles,
+                suppressedSSID: &hardCapSuppressed,
+                isInitialEvent: false,
+                now: t0 + .milliseconds(11900),
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .scheduleNextTick
+        )
+        #expect(
+            hardCapRoamPolicy.evaluateStep(
+                wifiOnlyLaunch: true,
+                poweredOn: true,
+                rawSSID: nil,
+                profiles: profiles,
+                suppressedSSID: &hardCapSuppressed,
+                isInitialEvent: nil,
+                now: t0 + .seconds(12),
+                performLaunch: {
+                    launchCount += 1
+                    return "bound Wi-Fi, launched app"
+                }
+            ) == .finish("no Wi-Fi name available, not launching")
+        )
+        #expect(hardCapSuppressed == "Pocket_5G")
+        #expect(launchCount == 2)
     }
 }
 

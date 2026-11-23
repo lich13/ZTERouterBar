@@ -61,6 +61,9 @@ object LayoutSpec {
     fun detailPairsPerRow(screenWidthDp: Int): Int =
         if (screenWidthDp < COMPACT_MAX_WIDTH_DP) 1 else 2
 
+    fun probeGridColumns(screenWidthDp: Int): Int =
+        if (screenWidthDp < COMPACT_MAX_WIDTH_DP) 1 else 2
+
     fun chartYDomain(metric: SignalChartMetric, values: List<Double>): Pair<Double, Double> {
         val minV = values.minOrNull() ?: 0.0
         val maxV = values.maxOrNull() ?: 0.0

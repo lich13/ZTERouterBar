@@ -323,3 +323,74 @@ object WANIPChangeFormatter {
         }
     }
 }
+
+data class ProbeEndpoint(
+    val id: String,
+    val name: String,
+    val urlString: String,
+    val timeoutSec: Int = DEFAULT_TIMEOUT_SEC
+) {
+    val isValidHttpUrl: Boolean
+        get() {
+            val trimmed = urlString.trim()
+            if (trimmed.isEmpty()) return false
+            val uri = runCatching { URI(trimmed) }.getOrNull() ?: return false
+            val scheme = uri.scheme?.lowercase(Locale.ROOT).orEmpty()
+            val host = uri.host.orEmpty()
+            return (scheme == "http" || scheme == "https") && host.isNotEmpty()
+        }
+
+    val displayTitle: String
+        get() {
+            val clean = name.trim()
+            if (clean.isNotEmpty()) return clean
+            val host = runCatching { URI(urlString.trim()).host }.getOrNull().orEmpty()
+            return when {
+                host.isNotEmpty() -> host
+                urlString.isNotEmpty() -> urlString
+                else -> "未命名节点"
+            }
+        }
+
+    companion object {
+        const val DEFAULT_TIMEOUT_SEC = 10
+
+        fun defaultPresets(): List<ProbeEndpoint> = listOf(
+            ProbeEndpoint(
+                id = "661313-204",
+                name = "661313 204",
+                urlString = "https://661313.xyz/test/generate_204",
+                timeoutSec = DEFAULT_TIMEOUT_SEC
+            ),
+            ProbeEndpoint(
+                id = "youtube-204",
+                name = "YouTube 204",
+                urlString = "https://www.youtube.com/generate_204",
+                timeoutSec = DEFAULT_TIMEOUT_SEC
+            ),
+            ProbeEndpoint(
+                id = "cloudflare-doh",
+                name = "Cloudflare DoH",
+                urlString = "https://cloudflare-dns.com/cdn-cgi/trace",
+                timeoutSec = DEFAULT_TIMEOUT_SEC
+            ),
+            ProbeEndpoint(
+                id = "telegram-api",
+                name = "Telegram API",
+                urlString = "https://api.telegram.org/",
+                timeoutSec = DEFAULT_TIMEOUT_SEC
+            )
+        )
+    }
+}
+
+data class EndpointProbeOutcome(
+    val id: String,
+    val name: String,
+    val urlString: String,
+    val reachable: Boolean,
+    val statusCode: Int? = null,
+    val elapsedMs: Int = 0,
+    val errorMessage: String? = null,
+    val checkedAtMs: Long = 0L
+)

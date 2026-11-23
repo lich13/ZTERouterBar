@@ -5,7 +5,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.zte.routerbar.core.AuthHashPreference
+import com.zte.routerbar.core.EndpointProbeOutcome
+import com.zte.routerbar.core.EndpointProbing
+import com.zte.routerbar.core.HttpEndpointProber
 import com.zte.routerbar.core.HttpUrlConnectionTransport
+import com.zte.routerbar.core.ProbeEndpoint
 import com.zte.routerbar.core.RouterEndpointConfig
 import com.zte.routerbar.core.RouterProfile
 import com.zte.routerbar.core.RouterProfileMatcher
@@ -27,9 +31,13 @@ import com.zte.routerbar.data.StoredAppSettings
 import com.zte.routerbar.data.WifiLanMonitor
 import com.zte.routerbar.data.WifiLanState
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -60,6 +68,10 @@ data class RouterUiState(
     val isReconnectingWan: Boolean = false,
     val isSavingProfile: Boolean = false,
     val isSessionOccupied: Boolean = false,
+    val probeEndpoints: List<ProbeEndpoint> = ProbeEndpoint.defaultPresets(),
+    val probeOutcomes: Map<String, EndpointProbeOutcome> = emptyMap(),
+    val isProbingNodes: Boolean = false,
+    val lastProbeCompletedAtMs: Long? = null,
     val lastError: String? = null,
     val statusToast: String? = null,
     val reconnectIpBanner: ReconnectIpBanner? = null,
@@ -104,6 +116,9 @@ class RouterViewModel(
             transport = HttpUrlConnectionTransport(networkProvider = wifiMonitor::currentWifiNetwork)
         )
     },
+    private val endpointProber: EndpointProbing = HttpEndpointProber(
+        connectionOpener = wifiMonitor::openProbeConnection
+    ),
     private val clockMs: () -> Long = { System.currentTimeMillis() },
     private val delayFn: suspend (Long) -> Unit = { delay(it) },
     private val externalScope: CoroutineScope? = null
@@ -119,6 +134,8 @@ class RouterViewModel(
     private var activePassword: String = ""
     private var clientGeneration: Int = 0
     private var pollingJob: Job? = null
+    private var probeJob: Job? = null
+    private val probeInFlight = AtomicBoolean(false)
     private var toastClearJob: Job? = null
     private var isForegroundActive: Boolean = false
     private var needsInitialSessionReclaim: Boolean = true
@@ -632,6 +649,42 @@ class RouterViewModel(
         scope.launch { refreshNow(silent = false) }
     }
 
+    fun triggerManualProbe() {
+        if (probeJob?.isActive == true || probeInFlight.get()) return
+        probeJob = scope.launch { runSingleProbeRound() }
+    }
+
+    suspend fun runSingleProbeRound() {
+        val endpoints = _uiState.value.probeEndpoints
+        if (endpoints.isEmpty()) return
+        if (!probeInFlight.compareAndSet(false, true)) return
+
+        _uiState.update {
+            it.copy(
+                isProbingNodes = true,
+                probeOutcomes = emptyMap()
+            )
+        }
+        try {
+            wifiMonitor.refresh()
+            coroutineScope {
+                endpoints.map { endpoint ->
+                    async {
+                        val outcome = endpointProber.check(endpoint)
+                        _uiState.update { state ->
+                            state.copy(probeOutcomes = state.probeOutcomes + (endpoint.id to outcome))
+                        }
+                        outcome
+                    }
+                }.awaitAll()
+            }
+            _uiState.update { it.copy(lastProbeCompletedAtMs = clockMs()) }
+        } finally {
+            probeInFlight.set(false)
+            _uiState.update { it.copy(isProbingNodes = false) }
+        }
+    }
+
     fun triggerReconnectWan() {
         scope.launch { reconnectWanNow() }
     }
@@ -706,6 +759,8 @@ class RouterViewModel(
     }
 
     override fun onCleared() {
+        probeJob?.cancel()
+        probeJob = null
         stopPollingLoop()
         wifiMonitor.close()
         super.onCleared()
