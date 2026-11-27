@@ -8,6 +8,12 @@ final class GlobalHotkeyManager {
     private var callback: (@MainActor () -> Void)?
 
     private static weak var activeInstance: GlobalHotkeyManager?
+    private nonisolated static let hotKeyEventHandler: EventHandlerUPP = { _, _, _ in
+        Task { @MainActor in
+            GlobalHotkeyManager.activeInstance?.callback?()
+        }
+        return noErr
+    }
 
     func register(enabled: Bool, onTrigger: @escaping @MainActor () -> Void) {
         unregister()
@@ -22,12 +28,7 @@ final class GlobalHotkeyManager {
 
         let status = InstallEventHandler(
             GetApplicationEventTarget(),
-            { _, _, _ in
-                Task { @MainActor in
-                    GlobalHotkeyManager.activeInstance?.callback?()
-                }
-                return noErr
-            },
+            Self.hotKeyEventHandler,
             1,
             &eventType,
             nil,

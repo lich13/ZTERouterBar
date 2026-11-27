@@ -1,4 +1,5 @@
 import Foundation
+import notify
 import Testing
 @testable import ZTERouterCore
 
@@ -1396,6 +1397,50 @@ struct ZTERouterCoreTests {
         )
         #expect(hardCapSuppressed == "Pocket_5G")
         #expect(launchCount == 2)
+    }
+
+    @Test("DarwinNotificationToken registered from @MainActor delivers on background queue without actor trap")
+    @MainActor
+    func testDarwinNotificationFromMainActorDeliversOnBackgroundQueue() async throws {
+        let queue = DispatchQueue(label: "com.zte.routerbar.test.notify")
+        let queueKey = DispatchSpecificKey<Bool>()
+        queue.setSpecific(key: queueKey, value: true)
+        let name = "self.com.zte.routerbar.test.\(UUID().uuidString)"
+        let stream = AsyncStream<Bool> { continuation in
+            let token = DarwinNotificationToken.register(name: name, queue: queue) {
+                continuation.yield(DispatchQueue.getSpecific(key: queueKey) == true)
+            }
+            guard let token else {
+                Issue.record("DarwinNotificationToken.register failed for in-process notification")
+                continuation.finish()
+                return
+            }
+            continuation.onTermination = { _ in
+                _ = token
+            }
+            let postStatus = notify_post(name)
+            if postStatus != UInt32(NOTIFY_STATUS_OK) {
+                Issue.record("notify_post returned status \(postStatus)")
+                continuation.finish()
+            }
+        }
+
+        let deliveredOnTargetQueue = await withTaskGroup(of: Bool?.self) { group in
+            group.addTask {
+                for await value in stream {
+                    return value
+                }
+                return nil
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(3))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        #expect(deliveredOnTargetQueue == true)
     }
 }
 

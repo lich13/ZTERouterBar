@@ -4,7 +4,6 @@ import CoreLocation
 import CoreWLAN
 import Foundation
 import Network
-import notify
 import ZTERouterCore
 
 @MainActor
@@ -19,7 +18,7 @@ final class WiFiNetworkMonitor: NSObject, CLLocationManagerDelegate, CWEventDele
     private let wifiClient = CWWiFiClient.shared()
     private let pathMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
     private let monitorQueue = DispatchQueue(label: "com.zte.routerbar.wifiMonitor")
-    @ObservationIgnored nonisolated(unsafe) private var networkChangeNotifyToken: Int32 = -1
+    @ObservationIgnored private var networkChangeToken: DarwinNotificationToken?
 
     private var screensKnownAsleep = false
     private var ssidRetryTask: Task<Void, Never>?
@@ -65,12 +64,10 @@ final class WiFiNetworkMonitor: NSObject, CLLocationManagerDelegate, CWEventDele
         }
         pathMonitor.start(queue: monitorQueue)
 
-        var token: Int32 = -1
-        let registerStatus = notify_register_dispatch(
-            "com.apple.system.config.network_change",
-            &token,
-            monitorQueue
-        ) { [weak self] _ in
+        self.networkChangeToken = DarwinNotificationToken.register(
+            name: "com.apple.system.config.network_change",
+            queue: monitorQueue
+        ) { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.refreshSSID(scheduleFollowUpIfNil: true)
@@ -79,18 +76,12 @@ final class WiFiNetworkMonitor: NSObject, CLLocationManagerDelegate, CWEventDele
                 }
             }
         }
-        if registerStatus == NOTIFY_STATUS_OK {
-            self.networkChangeNotifyToken = token
-        }
 
         registerSessionAndPowerObservers()
         refreshSSID(scheduleFollowUpIfNil: true)
     }
 
     deinit {
-        if networkChangeNotifyToken != -1 {
-            notify_cancel(networkChangeNotifyToken)
-        }
         pathMonitor.cancel()
     }
 

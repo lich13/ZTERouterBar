@@ -1,4 +1,5 @@
 import Foundation
+import notify
 
 public struct RouterProfile: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
@@ -381,5 +382,34 @@ public struct WiFiTriggerPollPolicy: Equatable, Sendable {
         case let .retryBriefBurst(reason):
             return now >= pollDeadline ? .finish("\(reason), not launching") : .scheduleNextTick
         }
+    }
+}
+
+package final class DarwinNotificationToken: Sendable {
+    private let rawToken: Int32
+
+    private init(rawToken: Int32) {
+        self.rawToken = rawToken
+    }
+
+    deinit {
+        notify_cancel(rawToken)
+    }
+
+    /// Registers a Darwin notification callback from a `nonisolated` context so `notify_handler_t`
+    /// (imported from `<notify.h>` without `@Sendable`) never inherits `@MainActor` isolation from callers.
+    package nonisolated static func register(
+        name: String,
+        queue: DispatchQueue,
+        handler: @escaping @Sendable () -> Void
+    ) -> DarwinNotificationToken? {
+        var token: Int32 = -1
+        let status = notify_register_dispatch(name, &token, queue) { _ in
+            handler()
+        }
+        guard status == NOTIFY_STATUS_OK, token != -1 else {
+            return nil
+        }
+        return DarwinNotificationToken(rawToken: token)
     }
 }

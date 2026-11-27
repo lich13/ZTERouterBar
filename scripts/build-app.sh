@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="ZTERouterBar"
 BUILD_CONFIG="${1:-release}"
-APP_VERSION="${APP_VERSION:-1.3.3}"
+APP_VERSION="${APP_VERSION:-1.3.4}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
 DIST_DIR="${ROOT_DIR}/dist"
 APP_BUNDLE="${DIST_DIR}/${APP_NAME}.app"

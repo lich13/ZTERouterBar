@@ -21,7 +21,7 @@ protocol UserNotificationSending: AnyObject {
 
 @MainActor
 @Observable
-final class SystemNotificationManager: NSObject, UserNotificationSending, @preconcurrency UNUserNotificationCenterDelegate {
+final class SystemNotificationManager: NSObject, UserNotificationSending, UNUserNotificationCenterDelegate {
     private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
 
     private let canUseCenter: Bool
@@ -134,7 +134,7 @@ final class SystemNotificationManager: NSObject, UserNotificationSending, @preco
     }
 
     // Ensure banners are presented even when Dashboard/Settings window is active in foreground.
-    func userNotificationCenter(
+    nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
